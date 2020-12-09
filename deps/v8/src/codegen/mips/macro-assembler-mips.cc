@@ -16,7 +16,7 @@
 #include "src/codegen/register-configuration.h"
 #include "src/debug/debug.h"
 #include "src/execution/frames-inl.h"
-#include "src/heap/heap-inl.h"  // For MemoryChunk.
+#include "src/heap/memory-chunk.h"
 #include "src/init/bootstrapper.h"
 #include "src/logging/counters.h"
 #include "src/objects/heap-number.h"
@@ -146,10 +146,11 @@ void TurboAssembler::PushCommonFrame(Register marker_reg) {
 void TurboAssembler::PushStandardFrame(Register function_reg) {
   int offset = -StandardFrameConstants::kContextOffset;
   if (function_reg.is_valid()) {
-    Push(ra, fp, cp, function_reg);
-    offset += kPointerSize;
+    Push(ra, fp, cp, function_reg, kJavaScriptCallArgCountRegister);
+    offset += 2 * kPointerSize;
   } else {
-    Push(ra, fp, cp);
+    Push(ra, fp, cp, kJavaScriptCallArgCountRegister);
+    offset += kPointerSize;
   }
   Addu(fp, sp, Operand(offset));
 }
@@ -3906,6 +3907,7 @@ void TurboAssembler::Call(Register target, int16_t offset, Condition cond,
     // Emit a nop in the branch delay slot if required.
     if (bd == PROTECT) nop();
   }
+  set_last_call_pc_(pc_);
 }
 
 // Note: To call gcc-compiled C code on mips, you must call through t9.
@@ -3938,6 +3940,7 @@ void TurboAssembler::Call(Register target, Register base, int16_t offset,
     // Emit a nop in the branch delay slot if required.
     if (bd == PROTECT) nop();
   }
+  set_last_call_pc_(pc_);
 }
 
 void TurboAssembler::Call(Address target, RelocInfo::Mode rmode, Condition cond,
@@ -4180,6 +4183,33 @@ void TurboAssembler::Push(Smi smi) {
   push(scratch);
 }
 
+void TurboAssembler::PushArray(Register array, Register size, Register scratch,
+                               Register scratch2, PushArrayOrder order) {
+  DCHECK(!AreAliased(array, size, scratch, scratch2));
+  Label loop, entry;
+  if (order == PushArrayOrder::kReverse) {
+    mov(scratch, zero_reg);
+    jmp(&entry);
+    bind(&loop);
+    Lsa(scratch2, array, scratch, kPointerSizeLog2);
+    Lw(scratch2, MemOperand(scratch2));
+    push(scratch2);
+    Addu(scratch, scratch, Operand(1));
+    bind(&entry);
+    Branch(&loop, less, scratch, Operand(size));
+  } else {
+    mov(scratch, size);
+    jmp(&entry);
+    bind(&loop);
+    Lsa(scratch2, array, scratch, kPointerSizeLog2);
+    Lw(scratch2, MemOperand(scratch2));
+    push(scratch2);
+    bind(&entry);
+    Addu(scratch, scratch, Operand(-1));
+    Branch(&loop, greater_equal, scratch, Operand(zero_reg));
+  }
+}
+
 void MacroAssembler::MaybeDropFrames() {
   // Check whether we need to drop frames to restart a function on the stack.
   li(a1, ExternalReference::debug_restart_fp_address(isolate()));
@@ -4348,8 +4378,9 @@ void MacroAssembler::InvokePrologue(Register expected_parameter_count,
                                     Label* done, InvokeFlag flag) {
   Label regular_invoke;
 
-  // Check whether the expected and actual arguments count match. The registers
-  // are set up according to contract with ArgumentsAdaptorTrampoline:
+  // Check whether the expected and actual arguments count match. The
+  // registers are set up according to contract with
+  // ArgumentsAdaptorTrampoline:
   //  a0: actual arguments count
   //  a1: function (passed through to callee)
   //  a2: expected arguments count
@@ -4383,8 +4414,8 @@ void MacroAssembler::CheckDebugHook(Register fun, Register new_target,
 
   {
     // Load receiver to pass it later to DebugOnFunctionCall hook.
-    Lsa(at, sp, actual_parameter_count, kPointerSizeLog2);
-    lw(t0, MemOperand(at));
+    LoadReceiver(t0, actual_parameter_count);
+
     FrameScope frame(this,
                      has_frame() ? StackFrame::NONE : StackFrame::INTERNAL);
     SmiTag(expected_parameter_count);
@@ -4668,6 +4699,7 @@ void MacroAssembler::DecrementCounter(StatsCounter* counter, int value,
 // Debugging.
 
 void TurboAssembler::Trap() { stop(); }
+void TurboAssembler::DebugBreak() { stop(); }
 
 void TurboAssembler::Assert(Condition cc, AbortReason reason, Register rs,
                             Operand rt) {
@@ -5374,31 +5406,38 @@ void TurboAssembler::CallCFunctionHelper(Register function_base,
 
     // Save the frame pointer and PC so that the stack layout remains iterable,
     // even without an ExitFrame which normally exists between JS and C frames.
-    if (isolate() != nullptr) {
-      // 't' registers are caller-saved so this is safe as a scratch register.
-      Register scratch1 = t4;
-      Register scratch2 = t5;
-      DCHECK(!AreAliased(scratch1, scratch2, function_base));
+    // 't' registers are caller-saved so this is safe as a scratch register.
+    Register pc_scratch = t4;
+    Register scratch = t5;
+    DCHECK(!AreAliased(pc_scratch, scratch, function_base));
 
-      Label get_pc;
-      mov(scratch1, ra);
-      Call(&get_pc);
+    mov(scratch, ra);
+    nal();
+    mov(pc_scratch, ra);
+    mov(ra, scratch);
 
-      bind(&get_pc);
-      mov(scratch2, ra);
-      mov(ra, scratch1);
-
-      li(scratch1, ExternalReference::fast_c_call_caller_pc_address(isolate()));
-      sw(scratch2, MemOperand(scratch1));
-      li(scratch1, ExternalReference::fast_c_call_caller_fp_address(isolate()));
-      sw(fp, MemOperand(scratch1));
+    // See x64 code for reasoning about how to address the isolate data fields.
+    if (root_array_available()) {
+      sw(pc_scratch, MemOperand(kRootRegister,
+                                IsolateData::fast_c_call_caller_pc_offset()));
+      sw(fp, MemOperand(kRootRegister,
+                        IsolateData::fast_c_call_caller_fp_offset()));
+    } else {
+      DCHECK_NOT_NULL(isolate());
+      li(scratch, ExternalReference::fast_c_call_caller_pc_address(isolate()));
+      sw(pc_scratch, MemOperand(scratch));
+      li(scratch, ExternalReference::fast_c_call_caller_fp_address(isolate()));
+      sw(fp, MemOperand(scratch));
     }
 
     Call(function_base, function_offset);
 
-    if (isolate() != nullptr) {
-      // We don't unset the PC; the FP is the source of truth.
-      Register scratch = t4;
+    // We don't unset the PC; the FP is the source of truth.
+    if (root_array_available()) {
+      sw(zero_reg, MemOperand(kRootRegister,
+                              IsolateData::fast_c_call_caller_fp_offset()));
+    } else {
+      DCHECK_NOT_NULL(isolate());
       li(scratch, ExternalReference::fast_c_call_caller_fp_address(isolate()));
       sw(zero_reg, MemOperand(scratch));
     }
@@ -5419,7 +5458,7 @@ void TurboAssembler::CallCFunctionHelper(Register function_base,
 void TurboAssembler::CheckPageFlag(Register object, Register scratch, int mask,
                                    Condition cc, Label* condition_met) {
   And(scratch, object, Operand(~kPageAlignmentMask));
-  lw(scratch, MemOperand(scratch, MemoryChunk::kFlagsOffset));
+  lw(scratch, MemOperand(scratch, BasicMemoryChunk::kFlagsOffset));
   And(scratch, scratch, Operand(mask));
   Branch(condition_met, cc, scratch, Operand(zero_reg));
 }
@@ -5469,7 +5508,9 @@ void TurboAssembler::ResetSpeculationPoisonRegister() {
   li(kSpeculationPoisonRegister, -1);
 }
 
-void TurboAssembler::CallForDeoptimization(Address target, int deopt_id) {
+void TurboAssembler::CallForDeoptimization(Address target, int deopt_id,
+                                           Label* exit, DeoptimizeKind kind) {
+  USE(exit, kind);
   NoRootArrayScope no_root_array(this);
 
   // Save the deipt id in kRootRegister (we don't need the roots array from now

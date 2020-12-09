@@ -36,7 +36,6 @@ namespace contextify {
 using errors::TryCatchScope;
 
 using v8::Array;
-using v8::ArrayBuffer;
 using v8::ArrayBufferView;
 using v8::Boolean;
 using v8::Context;
@@ -53,7 +52,10 @@ using v8::Isolate;
 using v8::Local;
 using v8::Maybe;
 using v8::MaybeLocal;
+using v8::MeasureMemoryExecution;
 using v8::MeasureMemoryMode;
+using v8::MicrotaskQueue;
+using v8::MicrotasksPolicy;
 using v8::Name;
 using v8::NamedPropertyHandlerConfiguration;
 using v8::Number;
@@ -108,7 +110,10 @@ Local<Name> Uint32ToName(Local<Context> context, uint32_t index) {
 
 ContextifyContext::ContextifyContext(
     Environment* env,
-    Local<Object> sandbox_obj, const ContextOptions& options) : env_(env) {
+    Local<Object> sandbox_obj,
+    const ContextOptions& options)
+  : env_(env),
+    microtask_queue_wrap_(options.microtask_queue_wrap) {
   MaybeLocal<Context> v8_context = CreateV8Context(env, sandbox_obj, options);
 
   // Allocation failure, maximum call stack size reached, termination, etc.
@@ -188,7 +193,13 @@ MaybeLocal<Context> ContextifyContext::CreateV8Context(
 
   object_template->SetHandler(config);
   object_template->SetHandler(indexed_config);
-  Local<Context> ctx = Context::New(env->isolate(), nullptr, object_template);
+  Local<Context> ctx = Context::New(
+      env->isolate(),
+      nullptr,  // extensions
+      object_template,
+      {},       // global object
+      {},       // deserialization callback
+      microtask_queue() ? microtask_queue().get() : nullptr);
   if (ctx.IsEmpty()) return MaybeLocal<Context>();
   // Only partially initialize the context - the primordials are left out
   // and only initialized when necessary.
@@ -247,7 +258,7 @@ void ContextifyContext::Init(Environment* env, Local<Object> target) {
 void ContextifyContext::MakeContext(const FunctionCallbackInfo<Value>& args) {
   Environment* env = Environment::GetCurrent(args);
 
-  CHECK_EQ(args.Length(), 5);
+  CHECK_EQ(args.Length(), 6);
   CHECK(args[0]->IsObject());
   Local<Object> sandbox = args[0].As<Object>();
 
@@ -272,6 +283,13 @@ void ContextifyContext::MakeContext(const FunctionCallbackInfo<Value>& args) {
 
   CHECK(args[4]->IsBoolean());
   options.allow_code_gen_wasm = args[4].As<Boolean>();
+
+  if (args[5]->IsObject() &&
+      !env->microtask_queue_ctor_template().IsEmpty() &&
+      env->microtask_queue_ctor_template()->HasInstance(args[5])) {
+    options.microtask_queue_wrap.reset(
+        Unwrap<MicrotaskQueueWrap>(args[5].As<Object>()));
+  }
 
   TryCatchScope try_catch(env);
   auto context_ptr = std::make_unique<ContextifyContext>(env, sandbox, options);
@@ -422,7 +440,7 @@ void ContextifyContext::PropertySetterCallback(
     args.GetReturnValue().Set(false);
   }
 
-  ctx->sandbox()->Set(ctx->context(), property, value).Check();
+  USE(ctx->sandbox()->Set(ctx->context(), property, value));
 }
 
 // static
@@ -440,9 +458,10 @@ void ContextifyContext::PropertyDescriptorCallback(
   Local<Object> sandbox = ctx->sandbox();
 
   if (sandbox->HasOwnProperty(context, property).FromMaybe(false)) {
-    args.GetReturnValue().Set(
-        sandbox->GetOwnPropertyDescriptor(context, property)
-            .ToLocalChecked());
+    Local<Value> desc;
+    if (sandbox->GetOwnPropertyDescriptor(context, property).ToLocal(&desc)) {
+      args.GetReturnValue().Set(desc);
+    }
   }
 }
 
@@ -485,8 +504,7 @@ void ContextifyContext::PropertyDefinerCallback(
           desc_for_sandbox->set_configurable(desc.configurable());
         }
         // Set the property on the sandbox.
-        sandbox->DefineProperty(context, property, *desc_for_sandbox)
-            .Check();
+        USE(sandbox->DefineProperty(context, property, *desc_for_sandbox));
       };
 
   if (desc.has_get() || desc.has_set()) {
@@ -764,8 +782,8 @@ void ContextifyScript::New(const FunctionCallbackInfo<Value>& args) {
         env->cached_data_rejected_string(),
         Boolean::New(isolate, source.GetCachedData()->rejected)).Check();
   } else if (produce_cached_data) {
-    const ScriptCompiler::CachedData* cached_data =
-      ScriptCompiler::CreateCodeCache(v8_script.ToLocalChecked());
+    std::unique_ptr<ScriptCompiler::CachedData> cached_data {
+      ScriptCompiler::CreateCodeCache(v8_script.ToLocalChecked()) };
     bool cached_data_produced = cached_data != nullptr;
     if (cached_data_produced) {
       MaybeLocal<Object> buf = Buffer::Copy(
@@ -845,6 +863,7 @@ void ContextifyScript::RunInThisContext(
               display_errors,
               break_on_sigint,
               break_on_first_line,
+              nullptr,  // microtask_queue
               args);
 
   TRACE_EVENT_NESTABLE_ASYNC_END0(
@@ -891,6 +910,7 @@ void ContextifyScript::RunInContext(const FunctionCallbackInfo<Value>& args) {
               display_errors,
               break_on_sigint,
               break_on_first_line,
+              contextify_context->microtask_queue(),
               args);
 
   TRACE_EVENT_NESTABLE_ASYNC_END0(
@@ -902,15 +922,18 @@ bool ContextifyScript::EvalMachine(Environment* env,
                                    const bool display_errors,
                                    const bool break_on_sigint,
                                    const bool break_on_first_line,
+                                   std::shared_ptr<MicrotaskQueue> mtask_queue,
                                    const FunctionCallbackInfo<Value>& args) {
   if (!env->can_call_into_js())
     return false;
   if (!ContextifyScript::InstanceOf(env, args.Holder())) {
-    env->ThrowTypeError(
+    THROW_ERR_INVALID_THIS(
+        env,
         "Script methods can only be called on script instances.");
     return false;
   }
   TryCatchScope try_catch(env);
+  Isolate::SafeForTerminationScope safe_for_termination(env->isolate());
   ContextifyScript* wrapped_script;
   ASSIGN_OR_RETURN_UNWRAP(&wrapped_script, args.Holder(), false);
   Local<UnboundScript> unbound_script =
@@ -926,18 +949,24 @@ bool ContextifyScript::EvalMachine(Environment* env,
   MaybeLocal<Value> result;
   bool timed_out = false;
   bool received_signal = false;
+  auto run = [&]() {
+    MaybeLocal<Value> result = script->Run(env->context());
+    if (!result.IsEmpty() && mtask_queue)
+      mtask_queue->PerformCheckpoint(env->isolate());
+    return result;
+  };
   if (break_on_sigint && timeout != -1) {
     Watchdog wd(env->isolate(), timeout, &timed_out);
     SigintWatchdog swd(env->isolate(), &received_signal);
-    result = script->Run(env->context());
+    result = run();
   } else if (break_on_sigint) {
     SigintWatchdog swd(env->isolate(), &received_signal);
-    result = script->Run(env->context());
+    result = run();
   } else if (timeout != -1) {
     Watchdog wd(env->isolate(), timeout, &timed_out);
-    result = script->Run(env->context());
+    result = run();
   } else {
-    result = script->Run(env->context());
+    result = run();
   }
 
   // Convert the termination exception into a regular exception.
@@ -1122,14 +1151,14 @@ void ContextifyContext::CompileFunction(
       context_extensions.size(), context_extensions.data(), options,
       v8::ScriptCompiler::NoCacheReason::kNoCacheNoReason, &script);
 
-  if (maybe_fn.IsEmpty()) {
+  Local<Function> fn;
+  if (!maybe_fn.ToLocal(&fn)) {
     if (try_catch.HasCaught() && !try_catch.HasTerminated()) {
       errors::DecorateErrorStack(env, try_catch);
       try_catch.ReThrow();
     }
     return;
   }
-  Local<Function> fn = maybe_fn.ToLocalChecked();
 
   Local<Object> cache_key;
   if (!env->compiled_fn_entry_template()->NewInstance(
@@ -1211,33 +1240,63 @@ static void WatchdogHasPendingSigint(const FunctionCallbackInfo<Value>& args) {
 
 static void MeasureMemory(const FunctionCallbackInfo<Value>& args) {
   CHECK(args[0]->IsInt32());
+  CHECK(args[1]->IsInt32());
   int32_t mode = args[0].As<v8::Int32>()->Value();
+  int32_t execution = args[1].As<v8::Int32>()->Value();
   Isolate* isolate = args.GetIsolate();
-  Environment* env = Environment::GetCurrent(args);
-  Local<Context> context;
-  if (args[1]->IsUndefined()) {
-    context = isolate->GetCurrentContext();
-  } else {
-    CHECK(args[1]->IsObject());
-    ContextifyContext* sandbox =
-        ContextifyContext::ContextFromContextifiedSandbox(env,
-                                                          args[1].As<Object>());
-    CHECK_NOT_NULL(sandbox);
-    context = sandbox->context();
-    if (context.IsEmpty()) {  // Not yet fully initialized
-      return;
-    }
-  }
+
+  Local<Context> current_context = isolate->GetCurrentContext();
   Local<Promise::Resolver> resolver;
-  if (!Promise::Resolver::New(context).ToLocal(&resolver)) return;
-  std::unique_ptr<v8::MeasureMemoryDelegate> i =
+  if (!Promise::Resolver::New(current_context).ToLocal(&resolver)) return;
+  std::unique_ptr<v8::MeasureMemoryDelegate> delegate =
       v8::MeasureMemoryDelegate::Default(
-          isolate, context, resolver, static_cast<v8::MeasureMemoryMode>(mode));
-  CHECK_NOT_NULL(i);
+          isolate,
+          current_context,
+          resolver,
+          static_cast<v8::MeasureMemoryMode>(mode));
+  isolate->MeasureMemory(std::move(delegate),
+                         static_cast<v8::MeasureMemoryExecution>(execution));
   v8::Local<v8::Promise> promise = resolver->GetPromise();
 
   args.GetReturnValue().Set(promise);
 }
+
+MicrotaskQueueWrap::MicrotaskQueueWrap(Environment* env, Local<Object> obj)
+  : BaseObject(env, obj),
+    microtask_queue_(
+        MicrotaskQueue::New(env->isolate(), MicrotasksPolicy::kExplicit)) {
+  MakeWeak();
+}
+
+const std::shared_ptr<MicrotaskQueue>&
+MicrotaskQueueWrap::microtask_queue() const {
+  return microtask_queue_;
+}
+
+void MicrotaskQueueWrap::New(const FunctionCallbackInfo<Value>& args) {
+  CHECK(args.IsConstructCall());
+  new MicrotaskQueueWrap(Environment::GetCurrent(args), args.This());
+}
+
+void MicrotaskQueueWrap::Init(Environment* env, Local<Object> target) {
+  HandleScope scope(env->isolate());
+  Local<String> class_name =
+      FIXED_ONE_BYTE_STRING(env->isolate(), "MicrotaskQueue");
+
+  Local<FunctionTemplate> tmpl = env->NewFunctionTemplate(New);
+  tmpl->InstanceTemplate()->SetInternalFieldCount(
+      ContextifyScript::kInternalFieldCount);
+  tmpl->SetClassName(class_name);
+
+  if (target->Set(env->context(),
+                  class_name,
+                  tmpl->GetFunction(env->context()).ToLocalChecked())
+          .IsNothing()) {
+    return;
+  }
+  env->set_microtask_queue_ctor_template(tmpl);
+}
+
 
 void Initialize(Local<Object> target,
                 Local<Value> unused,
@@ -1247,6 +1306,7 @@ void Initialize(Local<Object> target,
   Isolate* isolate = env->isolate();
   ContextifyContext::Init(env, target);
   ContextifyScript::Init(env, target);
+  MicrotaskQueueWrap::Init(env, target);
 
   env->SetMethod(target, "startSigintWatchdog", StartSigintWatchdog);
   env->SetMethod(target, "stopSigintWatchdog", StopSigintWatchdog);
@@ -1265,13 +1325,27 @@ void Initialize(Local<Object> target,
 
   Local<Object> constants = Object::New(env->isolate());
   Local<Object> measure_memory = Object::New(env->isolate());
-  Local<Object> memory_mode = Object::New(env->isolate());
-  MeasureMemoryMode SUMMARY = MeasureMemoryMode::kSummary;
-  MeasureMemoryMode DETAILED = MeasureMemoryMode::kDetailed;
-  NODE_DEFINE_CONSTANT(memory_mode, SUMMARY);
-  NODE_DEFINE_CONSTANT(memory_mode, DETAILED);
-  READONLY_PROPERTY(measure_memory, "mode", memory_mode);
+  Local<Object> memory_execution = Object::New(env->isolate());
+
+  {
+    Local<Object> memory_mode = Object::New(env->isolate());
+    MeasureMemoryMode SUMMARY = MeasureMemoryMode::kSummary;
+    MeasureMemoryMode DETAILED = MeasureMemoryMode::kDetailed;
+    NODE_DEFINE_CONSTANT(memory_mode, SUMMARY);
+    NODE_DEFINE_CONSTANT(memory_mode, DETAILED);
+    READONLY_PROPERTY(measure_memory, "mode", memory_mode);
+  }
+
+  {
+    MeasureMemoryExecution DEFAULT = MeasureMemoryExecution::kDefault;
+    MeasureMemoryExecution EAGER = MeasureMemoryExecution::kEager;
+    NODE_DEFINE_CONSTANT(memory_execution, DEFAULT);
+    NODE_DEFINE_CONSTANT(memory_execution, EAGER);
+    READONLY_PROPERTY(measure_memory, "execution", memory_execution);
+  }
+
   READONLY_PROPERTY(constants, "measureMemory", measure_memory);
+
   target->Set(context, env->constants_string(), constants).Check();
 
   env->SetMethod(target, "measureMemory", MeasureMemory);

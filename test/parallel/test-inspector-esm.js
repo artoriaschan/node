@@ -78,7 +78,7 @@ async function testBreakpoint(session) {
 
   let { result } = await session.send({
     'method': 'Debugger.evaluateOnCallFrame', 'params': {
-      'callFrameId': '{"ordinal":0,"injectedScriptId":1}',
+      'callFrameId': session.pausedDetails().callFrames[0].callFrameId,
       'expression': 'k + t',
       'objectGroup': 'console',
       'includeCommandLineAPI': true,
@@ -109,4 +109,4 @@ async function runTest() {
   assert.strictEqual((await child.expectShutdown()).exitCode, 55);
 }
 
-runTest();
+runTest().then(common.mustCall());

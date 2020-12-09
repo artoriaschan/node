@@ -100,11 +100,11 @@ class DebugOptions : public Options {
 class EnvironmentOptions : public Options {
  public:
   bool abort_on_uncaught_exception = false;
+  std::vector<std::string> conditions;
   bool enable_source_maps = false;
   bool experimental_json_modules = false;
   bool experimental_modules = false;
   std::string experimental_specifier_resolution;
-  std::string es_module_specifier_resolution;
   bool experimental_wasm_modules = false;
   bool experimental_import_meta_resolve = false;
   std::string module_type;
@@ -115,6 +115,7 @@ class EnvironmentOptions : public Options {
   bool experimental_vm_modules = false;
   bool expose_internals = false;
   bool frozen_intrinsics = false;
+  int64_t heap_snapshot_near_heap_limit = 0;
   std::string heap_snapshot_signal;
   uint64_t max_http_header_size = 16 * 1024;
   bool no_deprecation = false;
@@ -138,8 +139,10 @@ class EnvironmentOptions : public Options {
   bool heap_prof = false;
 #endif  // HAVE_INSPECTOR
   std::string redirect_warnings;
+  std::string diagnostic_dir;
   bool test_udp_no_try_send = false;
   bool throw_deprecation = false;
+  bool trace_atomics_wait = false;
   bool trace_deprecation = false;
   bool trace_exit = false;
   bool trace_sync_io = false;
@@ -148,6 +151,12 @@ class EnvironmentOptions : public Options {
   bool trace_warnings = false;
   std::string unhandled_rejections;
   std::string userland_loader;
+  bool verify_base_objects =
+#ifdef DEBUG
+      true;
+#else
+      false;
+#endif  // DEBUG
 
   bool syntax_check_only = false;
   bool has_eval_string = false;
@@ -186,16 +195,22 @@ class PerIsolateOptions : public Options {
   bool no_node_snapshot = false;
   bool report_uncaught_exception = false;
   bool report_on_signal = false;
-  bool report_compact = false;
+  bool experimental_top_level_await = true;
   std::string report_signal = "SIGUSR2";
-  std::string report_filename;
-  std::string report_directory;
   inline EnvironmentOptions* get_per_env_options();
   void CheckOptions(std::vector<std::string>* errors) override;
 };
 
 class PerProcessOptions : public Options {
  public:
+  // Options shouldn't be here unless they affect the entire process scope, and
+  // that should avoided when possible.
+  //
+  // When an option is used during process initialization, it does not need
+  // protection, but any use after that will likely require synchronization
+  // using the node::per_process::cli_options_mutex, typically:
+  //
+  //     Mutex::ScopedLock lock(node::per_process::cli_options_mutex);
   std::shared_ptr<PerIsolateOptions> per_isolate { new PerIsolateOptions() };
 
   std::string title;
@@ -216,7 +231,8 @@ class PerProcessOptions : public Options {
   std::string icu_data_dir;
 #endif
 
-  // TODO(addaleax): Some of these could probably be per-Environment.
+  // Per-process because they affect singleton OpenSSL shared library state,
+  // or are used once during process intialization.
 #if HAVE_OPENSSL
   std::string openssl_config;
   std::string tls_cipher_list = DEFAULT_CIPHER_LIST_CORE;
@@ -232,10 +248,17 @@ class PerProcessOptions : public Options {
   bool force_fips_crypto = false;
 #endif
 #endif
+
+  // Per-process because reports can be triggered outside a known V8 context.
+  bool report_on_fatalerror = false;
+  bool report_compact = false;
+  std::string report_directory;
+  std::string report_filename;
+
+  // TODO(addaleax): Some of these could probably be per-Environment.
   std::string use_largepages = "off";
   bool trace_sigint = false;
   std::vector<std::string> cmdline;
-  bool report_on_fatalerror = false;
 
   inline PerIsolateOptions* get_per_isolate_options();
   void CheckOptions(std::vector<std::string>* errors) override;
@@ -405,6 +428,8 @@ class OptionsParser {
   // An implied option is composed of the information on where to store a
   // specific boolean value (if another specific option is encountered).
   struct Implication {
+    OptionType type;
+    std::string name;
     std::shared_ptr<BaseOptionField> target_field;
     bool target_value;
   };

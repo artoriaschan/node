@@ -51,6 +51,7 @@ namespace node {
   V(HTTPINCOMINGMESSAGE)                                                      \
   V(HTTPCLIENTREQUEST)                                                        \
   V(JSSTREAM)                                                                 \
+  V(JSUDPWRAP)                                                                \
   V(MESSAGEPORT)                                                              \
   V(PIPECONNECTWRAP)                                                          \
   V(PIPESERVERWRAP)                                                           \
@@ -58,6 +59,12 @@ namespace node {
   V(PROCESSWRAP)                                                              \
   V(PROMISE)                                                                  \
   V(QUERYWRAP)                                                                \
+  V(QLOGSTREAM)                                                               \
+  V(QUICCLIENTSESSION)                                                        \
+  V(QUICSERVERSESSION)                                                        \
+  V(QUICSENDWRAP)                                                             \
+  V(QUICSOCKET)                                                               \
+  V(QUICSTREAM)                                                               \
   V(SHUTDOWNWRAP)                                                             \
   V(SIGNALWRAP)                                                               \
   V(STATWATCHER)                                                              \
@@ -78,9 +85,16 @@ namespace node {
 #define NODE_ASYNC_CRYPTO_PROVIDER_TYPES(V)                                   \
   V(PBKDF2REQUEST)                                                            \
   V(KEYPAIRGENREQUEST)                                                        \
+  V(KEYGENREQUEST)                                                            \
+  V(KEYEXPORTREQUEST)                                                         \
+  V(CIPHERREQUEST)                                                            \
+  V(DERIVEBITSREQUEST)                                                        \
+  V(HASHREQUEST)                                                              \
   V(RANDOMBYTESREQUEST)                                                       \
   V(SCRYPTREQUEST)                                                            \
-  V(TLSWRAP)
+  V(SIGNREQUEST)                                                              \
+  V(TLSWRAP)                                                                  \
+  V(VERIFYREQUEST)
 #else
 #define NODE_ASYNC_CRYPTO_PROVIDER_TYPES(V)
 #endif  // HAVE_OPENSSL
@@ -99,6 +113,7 @@ namespace node {
 
 class Environment;
 class DestroyParam;
+class ExternalReferenceRegistry;
 
 class AsyncWrap : public BaseObject {
  public:
@@ -128,6 +143,7 @@ class AsyncWrap : public BaseObject {
   static v8::Local<v8::FunctionTemplate> GetConstructorTemplate(
       Environment* env);
 
+  static void RegisterExternalReferences(ExternalReferenceRegistry* registry);
   static void Initialize(v8::Local<v8::Object> target,
                          v8::Local<v8::Value> unused,
                          v8::Local<v8::Context> context,
@@ -136,9 +152,15 @@ class AsyncWrap : public BaseObject {
   static void GetAsyncId(const v8::FunctionCallbackInfo<v8::Value>& args);
   static void PushAsyncContext(const v8::FunctionCallbackInfo<v8::Value>& args);
   static void PopAsyncContext(const v8::FunctionCallbackInfo<v8::Value>& args);
+  static void ExecutionAsyncResource(
+      const v8::FunctionCallbackInfo<v8::Value>& args);
+  static void ClearAsyncIdStack(
+      const v8::FunctionCallbackInfo<v8::Value>& args);
   static void AsyncReset(const v8::FunctionCallbackInfo<v8::Value>& args);
   static void GetProviderType(const v8::FunctionCallbackInfo<v8::Value>& args);
   static void QueueDestroyAsyncId(
+    const v8::FunctionCallbackInfo<v8::Value>& args);
+  static void SetCallbackTrampoline(
     const v8::FunctionCallbackInfo<v8::Value>& args);
 
   static void EmitAsyncInit(Environment* env,
@@ -152,7 +174,7 @@ class AsyncWrap : public BaseObject {
   static void EmitAfter(Environment* env, double async_id);
   static void EmitPromiseResolve(Environment* env, double async_id);
 
-  void EmitDestroy();
+  void EmitDestroy(bool from_gc = false);
 
   void EmitTraceEventBefore();
   static void EmitTraceEventAfter(ProviderType type, double async_id);
@@ -199,7 +221,6 @@ class AsyncWrap : public BaseObject {
                                         v8::Local<v8::Object> obj);
 
   bool IsDoneInitializing() const override;
-  v8::Local<v8::Object> GetResource();
 
  private:
   friend class PromiseWrap;
@@ -209,12 +230,16 @@ class AsyncWrap : public BaseObject {
             ProviderType provider,
             double execution_async_id,
             bool silent);
+  AsyncWrap(Environment* env,
+            v8::Local<v8::Object> promise,
+            ProviderType provider,
+            double execution_async_id,
+            double trigger_async_id);
   ProviderType provider_type_ = PROVIDER_NONE;
   bool init_hook_ran_ = false;
   // Because the values may be Reset(), cannot be made const.
   double async_id_ = kInvalidAsyncId;
   double trigger_async_id_;
-  v8::Global<v8::Object> resource_;
 };
 
 }  // namespace node

@@ -26,6 +26,7 @@
     'uv_library%': 'static_library',
 
     'clang%': 0,
+    'error_on_warn%': 'false',
 
     'openssl_fips%': '',
     'openssl_no_asm%': 0,
@@ -35,7 +36,7 @@
 
     # Reset this number to 0 on major V8 upgrades.
     # Increment by one for each non-official patch applied to deps/v8.
-    'v8_embedder_string': '-node.11',
+    'v8_embedder_string': '-node.20',
 
     ##### V8 defaults for Node.js #####
 
@@ -53,8 +54,17 @@
     # Enable disassembler for `--print-code` v8 options
     'v8_enable_disassembler': 1,
 
+    # Sets -dOBJECT_PRINT.
+    'v8_enable_object_print%': 1,
+
     # https://github.com/nodejs/node/pull/22920/files#r222779926
     'v8_enable_handle_zapping': 0,
+
+    # Disable pointer compression. Can be enabled at build time via configure
+    # options but default values are required here as this file is also used by
+    # node-gyp to build addons.
+    'v8_enable_pointer_compression%': 0,
+    'v8_enable_31bit_smis_on_64bit_arch%': 0,
 
     # Disable V8 untrusted code mitigations.
     # See https://github.com/v8/v8/wiki/Untrusted-code-mitigations
@@ -101,6 +111,9 @@
       ['target_arch in "ppc64 s390x"', {
         'v8_enable_backtrace': 1,
       }],
+      ['OS=="linux"', {
+        'node_section_ordering_info%': ''
+      }]
     ],
   },
 
@@ -162,6 +175,20 @@
         },
         'cflags': [ '-O3' ],
         'conditions': [
+          ['OS=="linux"', {
+            'conditions': [
+              ['node_section_ordering_info!=""', {
+                'cflags': [
+                  '-fuse-ld=gold',
+                  '-ffunction-sections',
+                ],
+                'ldflags': [
+                  '-fuse-ld=gold',
+                  '-Wl,--section-ordering-file=<(node_section_ordering_info)',
+                ],
+              }],
+            ],
+          }],
           ['OS=="solaris"', {
             # pull in V8's postmortem metadata
             'ldflags': [ '-Wl,-z,allextract' ]
@@ -192,6 +219,11 @@
         ],
         'msvs_settings': {
           'VCCLCompilerTool': {
+            'conditions': [
+              ['target_arch=="arm64"', {
+                'FloatingPointModel': 1 # /fp:strict
+              }]
+            ],
             'EnableFunctionLevelLinking': 'true',
             'EnableIntrinsicFunctions': 'true',
             'FavorSizeOrSpeed': 1,          # /Ot, favor speed over size
@@ -218,7 +250,14 @@
     # Forcibly disable -Werror.  We support a wide range of compilers, it's
     # simply not feasible to squelch all warnings, never mind that the
     # libraries in deps/ are not under our control.
-    'cflags!': ['-Werror'],
+    'conditions': [
+      [ 'error_on_warn=="false"', {
+        'cflags!': ['-Werror'],
+      }, '(_target_name!="<(node_lib_target_name)" or '
+          '_target_name!="<(node_core_target_name)")', {
+        'cflags!': ['-Werror'],
+      }],
+    ],
     'msvs_settings': {
       'VCCLCompilerTool': {
         'BufferSecurityCheck': 'true',
@@ -284,8 +323,9 @@
         'cflags+': [
           '-fno-omit-frame-pointer',
           '-fsanitize=address',
-          '-DLEAK_SANITIZER'
+          '-fsanitize-address-use-after-scope',
         ],
+        'defines': [ 'LEAK_SANITIZER', 'V8_USE_ADDRESS_SANITIZER' ],
         'cflags!': [ '-fomit-frame-pointer' ],
         'ldflags': [ '-fsanitize=address' ],
       }],
@@ -455,8 +495,7 @@
           ['_type!="static_library"', {
             'xcode_settings': {
               'OTHER_LDFLAGS': [
-                '-Wl,-no_pie',
-                '-Wl,-search_paths_first',
+                '-Wl,-search_paths_first'
               ],
             },
           }],
@@ -467,6 +506,14 @@
           }],
           ['target_arch=="x64"', {
             'xcode_settings': {'ARCHS': ['x86_64']},
+          }],
+          ['target_arch=="arm64"', {
+            'xcode_settings': {
+              'ARCHS': ['arm64'],
+              'OTHER_LDFLAGS!': [
+                '-Wl,-no_pie',
+              ],
+            },
           }],
           ['clang==1', {
             'xcode_settings': {

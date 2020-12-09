@@ -25,9 +25,8 @@ function getEnabledCategoriesFromCommandLine() {
   const indexOfCatFlag = process.execArgv.indexOf('--trace-event-categories');
   if (indexOfCatFlag === -1) {
     return undefined;
-  } else {
-    return process.execArgv[indexOfCatFlag + 1];
   }
+  return process.execArgv[indexOfCatFlag + 1];
 }
 
 const isChild = process.argv[2] === 'child';
@@ -150,8 +149,7 @@ function testApiInChildProcess(execArgs, cb) {
     const file = path.join(tmpdir.path, 'node_trace.1.log');
 
     assert(fs.existsSync(file));
-    fs.readFile(file, common.mustCall((err, data) => {
-      assert.ifError(err);
+    fs.readFile(file, common.mustSucceed((data) => {
       const traces = JSON.parse(data.toString()).traceEvents
         .filter((trace) => trace.cat !== '__metadata');
       assert.strictEqual(traces.length,

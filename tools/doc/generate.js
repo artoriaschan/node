@@ -25,6 +25,7 @@ const { promises: fs } = require('fs');
 const path = require('path');
 const unified = require('unified');
 const markdown = require('remark-parse');
+const gfm = require('remark-gfm');
 const remark2rehype = require('remark-rehype');
 const raw = require('rehype-raw');
 const htmlStringify = require('rehype-stringify');
@@ -42,6 +43,7 @@ let filename = null;
 let nodeVersion = null;
 let outputDir = null;
 let apilinks = {};
+let versions = {};
 
 async function main() {
   for (const arg of args) {
@@ -58,6 +60,13 @@ async function main() {
         throw new Error(`${linkFile} is empty`);
       }
       apilinks = JSON.parse(data);
+    } else if (arg.startsWith('--versions-file=')) {
+      const versionsFile = arg.replace(/^--versions-file=/, '');
+      const data = await fs.readFile(versionsFile, 'utf8');
+      if (!data.trim()) {
+        throw new Error(`${versionsFile} is empty`);
+      }
+      versions = JSON.parse(data);
     }
   }
 
@@ -74,17 +83,19 @@ async function main() {
   const content = await unified()
     .use(replaceLinks, { filename, linksMapper })
     .use(markdown)
-    .use(html.preprocessText)
+    .use(gfm)
+    .use(html.preprocessText, { nodeVersion })
     .use(json.jsonAPI, { filename })
     .use(html.firstHeader)
     .use(html.preprocessElements, { filename })
     .use(html.buildToc, { filename, apilinks })
-    .use(remark2rehype, { allowDangerousHTML: true })
+    .use(remark2rehype, { allowDangerousHtml: true })
     .use(raw)
     .use(htmlStringify)
     .process(input);
 
-  const myHtml = await html.toHTML({ input, content, filename, nodeVersion });
+  const myHtml = await html.toHTML({ input, content, filename, nodeVersion,
+                                     versions });
   const basename = path.basename(filename, '.md');
   const htmlTarget = path.join(outputDir, `${basename}.html`);
   const jsonTarget = path.join(outputDir, `${basename}.json`);

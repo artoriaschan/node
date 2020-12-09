@@ -1,4 +1,5 @@
 #include "env-inl.h"
+#include "json_utils.h"
 #include "node_report.h"
 #include "debug_utils-inl.h"
 #include "diagnosticfilename-inl.h"
@@ -11,11 +12,12 @@
 #ifdef _WIN32
 #include <Windows.h>
 #else  // !_WIN32
-#include <sys/resource.h>
 #include <cxxabi.h>
+#include <sys/resource.h>
 #include <dlfcn.h>
 #endif
 
+#include <iostream>
 #include <cstring>
 #include <ctime>
 #include <cwctype>
@@ -30,20 +32,24 @@ using node::arraysize;
 using node::ConditionVariable;
 using node::DiagnosticFilename;
 using node::Environment;
+using node::JSONWriter;
 using node::Mutex;
 using node::NativeSymbolDebuggingContext;
-using node::PerIsolateOptions;
 using node::TIME_TYPE;
 using node::worker::Worker;
+using v8::Array;
+using v8::Context;
 using v8::HeapSpaceStatistics;
 using v8::HeapStatistics;
 using v8::Isolate;
 using v8::Local;
-using v8::Number;
-using v8::StackTrace;
+using v8::Object;
 using v8::String;
+using v8::TryCatch;
 using v8::V8;
 using v8::Value;
+
+namespace per_process = node::per_process;
 
 // Internal/static function declarations
 static void WriteNodeReport(Isolate* isolate,
@@ -52,13 +58,16 @@ static void WriteNodeReport(Isolate* isolate,
                             const char* trigger,
                             const std::string& filename,
                             std::ostream& out,
-                            Local<String> stackstr,
+                            Local<Object> error,
                             bool compact);
 static void PrintVersionInformation(JSONWriter* writer);
-static void PrintJavaScriptStack(JSONWriter* writer,
-                                 Isolate* isolate,
-                                 Local<String> stackstr,
-                                 const char* trigger);
+static void PrintJavaScriptErrorStack(JSONWriter* writer,
+                                      Isolate* isolate,
+                                      Local<Object> error,
+                                      const char* trigger);
+static void PrintJavaScriptErrorProperties(JSONWriter* writer,
+                                           Isolate* isolate,
+                                           Local<Object> error);
 static void PrintNativeStack(JSONWriter* writer);
 static void PrintResourceUsage(JSONWriter* writer);
 static void PrintGCStatistics(JSONWriter* writer, Isolate* isolate);
@@ -70,29 +79,32 @@ static void PrintCpuInfo(JSONWriter* writer);
 static void PrintNetworkInterfaceInfo(JSONWriter* writer);
 
 // External function to trigger a report, writing to file.
-// The 'name' parameter is in/out: an input filename is used
-// if supplied, and the actual filename is returned.
 std::string TriggerNodeReport(Isolate* isolate,
                               Environment* env,
                               const char* message,
                               const char* trigger,
                               const std::string& name,
-                              Local<String> stackstr) {
+                              Local<Object> error) {
   std::string filename;
-  std::shared_ptr<PerIsolateOptions> options;
-  if (env != nullptr) options = env->isolate_data()->options();
 
   // Determine the required report filename. In order of priority:
   //   1) supplied on API 2) configured on startup 3) default generated
   if (!name.empty()) {
     // Filename was specified as API parameter.
     filename = name;
-  } else if (env != nullptr && options->report_filename.length() > 0) {
-    // File name was supplied via start-up option.
-    filename = options->report_filename;
   } else {
-    filename = *DiagnosticFilename(env != nullptr ? env->thread_id() : 0,
-                                   "report", "json");
+    std::string report_filename;
+    {
+      Mutex::ScopedLock lock(per_process::cli_options_mutex);
+      report_filename = per_process::cli_options->report_filename;
+    }
+    if (report_filename.length() > 0) {
+      // File name was supplied via start-up option.
+      filename = report_filename;
+    } else {
+      filename = *DiagnosticFilename(env != nullptr ? env->thread_id() : 0,
+          "report", "json");
+    }
   }
 
   // Open the report file stream for writing. Supports stdout/err,
@@ -104,9 +116,14 @@ std::string TriggerNodeReport(Isolate* isolate,
   } else if (filename == "stderr") {
     outstream = &std::cerr;
   } else {
+    std::string report_directory;
+    {
+      Mutex::ScopedLock lock(per_process::cli_options_mutex);
+      report_directory = per_process::cli_options->report_directory;
+    }
     // Regular file. Append filename to directory path if one was specified
-    if (env != nullptr && options->report_directory.length() > 0) {
-      std::string pathname = options->report_directory;
+    if (report_directory.length() > 0) {
+      std::string pathname = report_directory;
       pathname += node::kPathSeparator;
       pathname += filename;
       outfile.open(pathname, std::ios::out | std::ios::binary);
@@ -117,8 +134,8 @@ std::string TriggerNodeReport(Isolate* isolate,
     if (!outfile.is_open()) {
       std::cerr << "\nFailed to open Node.js report file: " << filename;
 
-      if (env != nullptr && options->report_directory.length() > 0)
-        std::cerr << " directory: " << options->report_directory;
+      if (report_directory.length() > 0)
+        std::cerr << " directory: " << report_directory;
 
       std::cerr << " (errno: " << errno << ")" << std::endl;
       return "";
@@ -127,16 +144,23 @@ std::string TriggerNodeReport(Isolate* isolate,
     std::cerr << "\nWriting Node.js report to file: " << filename;
   }
 
-  bool compact = env != nullptr ? options->report_compact : true;
+  bool compact;
+  {
+    Mutex::ScopedLock lock(per_process::cli_options_mutex);
+    compact = per_process::cli_options->report_compact;
+  }
   WriteNodeReport(isolate, env, message, trigger, filename, *outstream,
-                  stackstr, compact);
+                  error, compact);
 
   // Do not close stdout/stderr, only close files we opened.
   if (outfile.is_open()) {
     outfile.close();
   }
 
-  std::cerr << "\nNode.js report completed" << std::endl;
+  // Do not mix JSON and free-form text on stderr.
+  if (filename != "stderr") {
+    std::cerr << "\nNode.js report completed" << std::endl;
+  }
   return filename;
 }
 
@@ -145,9 +169,9 @@ void GetNodeReport(Isolate* isolate,
                    Environment* env,
                    const char* message,
                    const char* trigger,
-                   Local<String> stackstr,
+                   Local<Object> error,
                    std::ostream& out) {
-  WriteNodeReport(isolate, env, message, trigger, "", out, stackstr, false);
+  WriteNodeReport(isolate, env, message, trigger, "", out, error, false);
 }
 
 // Internal function to coordinate and write the various
@@ -158,7 +182,7 @@ static void WriteNodeReport(Isolate* isolate,
                             const char* trigger,
                             const std::string& filename,
                             std::ostream& out,
-                            Local<String> stackstr,
+                            Local<Object> error,
                             bool compact) {
   // Obtain the current time and the pid.
   TIME_TYPE tm_struct;
@@ -243,8 +267,13 @@ static void WriteNodeReport(Isolate* isolate,
   PrintVersionInformation(&writer);
   writer.json_objectend();
 
-  // Report summary JavaScript stack backtrace
-  PrintJavaScriptStack(&writer, isolate, stackstr, trigger);
+  writer.json_objectstart("javascriptStack");
+  // Report summary JavaScript error stack backtrace
+  PrintJavaScriptErrorStack(&writer, isolate, error, trigger);
+
+  // Report summary JavaScript error properties backtrace
+  PrintJavaScriptErrorProperties(&writer, isolate, error);
+  writer.json_objectend();  // the end of 'javascriptStack'
 
   // Report native stack backtrace
   PrintNativeStack(&writer);
@@ -265,6 +294,10 @@ static void WriteNodeReport(Isolate* isolate,
         static_cast<bool>(uv_loop_alive(env->event_loop())));
     writer.json_keyvalue("address",
         ValueToHexString(reinterpret_cast<int64_t>(env->event_loop())));
+
+    // Report Event loop idle time
+    uint64_t idle_time = uv_metrics_idle_time(env->event_loop());
+    writer.json_keyvalue("loopIdleTimeSeconds", 1.0 * idle_time / 1e9);
     writer.json_end();
   }
 
@@ -285,7 +318,7 @@ static void WriteNodeReport(Isolate* isolate,
                       env,
                       "Worker thread subreport",
                       trigger,
-                      Local<String>(),
+                      Local<Object>(),
                       os);
 
         Mutex::ScopedLock lock(workers_mutex);
@@ -439,18 +472,56 @@ static void PrintNetworkInterfaceInfo(JSONWriter* writer) {
   }
 }
 
-// Report the JavaScript stack.
-static void PrintJavaScriptStack(JSONWriter* writer,
-                                 Isolate* isolate,
-                                 Local<String> stackstr,
-                                 const char* trigger) {
-  writer->json_objectstart("javascriptStack");
+static void PrintJavaScriptErrorProperties(JSONWriter* writer,
+                                           Isolate* isolate,
+                                           Local<Object> error) {
+  writer->json_objectstart("errorProperties");
+  if (!error.IsEmpty()) {
+    TryCatch try_catch(isolate);
+    Local<Context> context = error->GetIsolate()->GetCurrentContext();
+    Local<Array> keys;
+    if (!error->GetOwnPropertyNames(context).ToLocal(&keys)) {
+      return writer->json_objectend();  // the end of 'errorProperties'
+    }
+    uint32_t keys_length = keys->Length();
+    for (uint32_t i = 0; i < keys_length; i++) {
+      Local<Value> key;
+      if (!keys->Get(context, i).ToLocal(&key) || !key->IsString()) {
+        continue;
+      }
+      Local<Value> value;
+      Local<String> value_string;
+      if (!error->Get(context, key).ToLocal(&value) ||
+          !value->ToString(context).ToLocal(&value_string)) {
+        continue;
+      }
+      String::Utf8Value k(isolate, key);
+      if (!strcmp(*k, "stack") || !strcmp(*k, "message")) continue;
+      String::Utf8Value v(isolate, value_string);
+      writer->json_keyvalue(std::string(*k, k.length()),
+                            std::string(*v, v.length()));
+    }
+  }
+  writer->json_objectend();  // the end of 'errorProperties'
+}
 
-  std::string ss;
+// Report the JavaScript stack.
+static void PrintJavaScriptErrorStack(JSONWriter* writer,
+                                 Isolate* isolate,
+                                 Local<Object> error,
+                                 const char* trigger) {
+  Local<Value> stackstr;
+  std::string ss = "";
+  TryCatch try_catch(isolate);
   if ((!strcmp(trigger, "FatalError")) ||
       (!strcmp(trigger, "Signal"))) {
     ss = "No stack.\nUnavailable.\n";
-  } else {
+  } else if (!error.IsEmpty() &&
+             error
+                 ->Get(isolate->GetCurrentContext(),
+                       node::FIXED_ONE_BYTE_STRING(isolate,
+                                                   "stack"))
+                 .ToLocal(&stackstr)) {
     String::Utf8Value sv(isolate, stackstr);
     ss = std::string(*sv, sv.length());
   }
@@ -474,7 +545,6 @@ static void PrintJavaScriptStack(JSONWriter* writer,
     }
     writer->json_arrayend();
   }
-  writer->json_objectend();
 }
 
 // Report a native stack backtrace

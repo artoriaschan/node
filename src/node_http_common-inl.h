@@ -31,8 +31,7 @@ NgHeaders<T>::NgHeaders(Environment* env, v8::Local<v8::Array> headers) {
                                  count_ * sizeof(nv_t) +
                                  header_string_len);
 
-  char* start = reinterpret_cast<char*>(
-      RoundUp(reinterpret_cast<uintptr_t>(*buf_), alignof(nv_t)));
+  char* start = AlignUp(buf_.out(), alignof(nv_t));
   char* header_contents = start + (count_ * sizeof(nv_t));
   nv_t* const nva = reinterpret_cast<nv_t*>(start);
 
@@ -56,13 +55,14 @@ NgHeaders<T>::NgHeaders(Environment* env, v8::Local<v8::Array> headers) {
       return;
     }
 
-    nva[n].flags = T::kNoneFlag;
     nva[n].name = reinterpret_cast<uint8_t*>(p);
     nva[n].namelen = strlen(p);
     p += nva[n].namelen + 1;
     nva[n].value = reinterpret_cast<uint8_t*>(p);
     nva[n].valuelen = strlen(p);
     p += nva[n].valuelen + 1;
+    nva[n].flags = *p;
+    p++;
   }
 }
 
@@ -74,6 +74,14 @@ size_t GetClientMaxHeaderPairs(size_t max_header_pairs) {
 size_t GetServerMaxHeaderPairs(size_t max_header_pairs) {
   static constexpr size_t min_header_pairs = 4;
   return std::max(max_header_pairs, min_header_pairs);
+}
+
+template <typename allocator_t>
+std::string NgHeaderBase<allocator_t>::ToString() const {
+  std::string ret = name();
+  ret += " = ";
+  ret += value();
+  return ret;
 }
 
 template <typename T>
@@ -133,6 +141,12 @@ NgHeader<T>::NgHeader(NgHeader<T>&& other) noexcept
 }
 
 template <typename T>
+void NgHeader<T>::MemoryInfo(MemoryTracker* tracker) const {
+  tracker->TrackField("name", name_);
+  tracker->TrackField("value", value_);
+}
+
+template <typename T>
 v8::MaybeLocal<v8::String> NgHeader<T>::GetName(
     NgHeader<T>::allocator_t* allocator) const {
 
@@ -143,7 +157,7 @@ v8::MaybeLocal<v8::String> NgHeader<T>::GetName(
   // If header_name is not nullptr, then it is a known header with
   // a statically defined name. We can safely internalize it here.
   if (header_name != nullptr) {
-    auto& static_str_map = env_->isolate_data()->http_static_strs;
+    auto& static_str_map = env_->isolate_data()->static_str_map;
     v8::Eternal<v8::String> eternal = static_str_map[header_name];
     if (eternal.IsEmpty()) {
       v8::Local<v8::String> str = OneByteString(env_->isolate(), header_name);
@@ -174,6 +188,11 @@ std::string NgHeader<T>::value() const {
 template <typename T>
 size_t NgHeader<T>::length() const {
   return name_.len() + value_.len();
+}
+
+template <typename T>
+uint8_t NgHeader<T>::flags() const {
+  return flags_;
 }
 
 }  // namespace node

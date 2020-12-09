@@ -27,7 +27,7 @@ const process = global.process;  // Some tests tamper with the process global.
 const assert = require('assert');
 const { exec, execSync, spawnSync } = require('child_process');
 const fs = require('fs');
-// Do not require 'os' until needed so that test-os-checked-fucnction can
+// Do not require 'os' until needed so that test-os-checked-function can
 // monkey patch it. If 'os' is required here, that test will fail.
 const path = require('path');
 const util = require('util');
@@ -50,6 +50,7 @@ const noop = () => {};
 
 const hasCrypto = Boolean(process.versions.openssl) &&
                   !process.env.NODE_SKIP_CRYPTO;
+const hasQuic = hasCrypto && Boolean(process.versions.ngtcp2);
 
 // Check for flags. Skip this for workers (both, the `cluster` module and
 // `worker_threads`) and child processes.
@@ -59,12 +60,12 @@ if (process.argv.length === 2 &&
     !process.env.NODE_SKIP_FLAG_CHECK &&
     isMainThread &&
     hasCrypto &&
-    module.parent &&
+    require.main &&
     require('cluster').isMaster) {
   // The copyright notice is relatively big and the flags could come afterwards.
   const bytesToRead = 1500;
   const buffer = Buffer.allocUnsafe(bytesToRead);
-  const fd = fs.openSync(module.parent.filename, 'r');
+  const fd = fs.openSync(require.main.filename, 'r');
   const bytesRead = fs.readSync(fd, buffer, 0, bytesToRead);
   fs.closeSync(fd);
   const source = buffer.toString('utf8', 0, bytesRead);
@@ -112,7 +113,7 @@ const isOpenBSD = process.platform === 'openbsd';
 const isLinux = process.platform === 'linux';
 const isOSX = process.platform === 'darwin';
 
-const rootDir = isWindows ? 'c:\\' : '/';
+const isDumbTerminal = process.env.TERM === 'dumb';
 
 const buildType = process.config.target_defaults ?
   process.config.target_defaults.default_configuration :
@@ -194,11 +195,9 @@ const PIPE = (() => {
   return path.join(pipePrefix, pipeName);
 })();
 
-/*
- * Check that when running a test with
- * `$node --abort-on-uncaught-exception $file child`
- * the process aborts.
- */
+// Check that when running a test with
+// `$node --abort-on-uncaught-exception $file child`
+// the process aborts.
 function childShouldThrowAndAbort() {
   let testCmd = '';
   if (!isWindows) {
@@ -264,6 +263,15 @@ let knownGlobals = [
   queueMicrotask,
 ];
 
+// TODO(@jasnell): This check can be temporary. AbortController is
+// not currently supported in either Node.js 12 or 10, making it
+// difficult to run tests comparitively on those versions. Once
+// all supported versions have AbortController as a global, this
+// check can be removed and AbortController can be added to the
+// knownGlobals list above.
+if (global.AbortController)
+  knownGlobals.push(global.AbortController);
+
 if (global.gc) {
   knownGlobals.push(global.gc);
 }
@@ -307,10 +315,9 @@ function runCallChecks(exitCode) {
     if ('minimum' in context) {
       context.messageSegment = `at least ${context.minimum}`;
       return context.actual < context.minimum;
-    } else {
-      context.messageSegment = `exactly ${context.exact}`;
-      return context.actual !== context.exact;
     }
+    context.messageSegment = `exactly ${context.exact}`;
+    return context.actual !== context.exact;
   });
 
   failed.forEach(function(context) {
@@ -326,6 +333,14 @@ function runCallChecks(exitCode) {
 
 function mustCall(fn, exact) {
   return _mustCallInner(fn, exact, 'exact');
+}
+
+function mustSucceed(fn, exact) {
+  return mustCall(function(err, ...args) {
+    assert.ifError(err);
+    if (typeof fn === 'function')
+      return fn.apply(this, args);
+  }, exact);
 }
 
 function mustCallAtLeast(fn, minimum) {
@@ -409,16 +424,19 @@ function getCallSite(top) {
   const err = new Error();
   Error.captureStackTrace(err, top);
   // With the V8 Error API, the stack is not formatted until it is accessed
-  err.stack;
+  err.stack; // eslint-disable-line no-unused-expressions
   Error.prepareStackTrace = originalStackFormatter;
   return err.stack;
 }
 
 function mustNotCall(msg) {
   const callSite = getCallSite(mustNotCall);
-  return function mustNotCall() {
+  return function mustNotCall(...args) {
+    const argsInfo = args.length > 0 ?
+      `\ncalled with arguments: ${args.map(util.inspect).join(', ')}` : '';
     assert.fail(
-      `${msg || 'function should not have been called'} at ${callSite}`);
+      `${msg || 'function should not have been called'} at ${callSite}` +
+      argsInfo);
   };
 }
 
@@ -463,9 +481,8 @@ function nodeProcessAborted(exitCode, signal) {
   // the expected exit codes or signals.
   if (signal !== null) {
     return expectedSignals.includes(signal);
-  } else {
-    return expectedExitCodes.includes(exitCode);
   }
+  return expectedExitCodes.includes(exitCode);
 }
 
 function isAlive(pid) {
@@ -596,11 +613,8 @@ function getBufferSources(buf) {
   return [...getArrayBufferViews(buf), new Uint8Array(buf).buffer];
 }
 
-// Crash the process on unhandled rejections.
-const crashOnUnhandledRejection = (err) => { throw err; };
-process.on('unhandledRejection', crashOnUnhandledRejection);
 function disableCrashOnUnhandledRejection() {
-  process.removeListener('unhandledRejection', crashOnUnhandledRejection);
+  process.on('unhandledRejection', () => {});
 }
 
 function getTTYfd() {
@@ -653,6 +667,50 @@ function invalidArgTypeHelper(input) {
   return ` Received type ${typeof input} (${inspected})`;
 }
 
+function skipIfDumbTerminal() {
+  if (isDumbTerminal) {
+    skip('skipping - dumb terminal');
+  }
+}
+
+function gcUntil(name, condition) {
+  if (typeof name === 'function') {
+    condition = name;
+    name = undefined;
+  }
+  return new Promise((resolve, reject) => {
+    let count = 0;
+    function gcAndCheck() {
+      setImmediate(() => {
+        count++;
+        global.gc();
+        if (condition()) {
+          resolve();
+        } else if (count < 10) {
+          gcAndCheck();
+        } else {
+          reject(name === undefined ? undefined : 'Test ' + name + ' failed');
+        }
+      });
+    }
+    gcAndCheck();
+  });
+}
+
+function requireNoPackageJSONAbove() {
+  let possiblePackage = path.join(__dirname, '..', 'package.json');
+  let lastPackage = null;
+  while (possiblePackage !== lastPackage) {
+    if (fs.existsSync(possiblePackage)) {
+      assert.fail(
+        'This test shouldn\'t load properties from a package.json above ' +
+        `its file location. Found package.json at ${possiblePackage}.`);
+    }
+    lastPackage = possiblePackage;
+    possiblePackage = path.join(possiblePackage, '..', '..', 'package.json');
+  }
+}
+
 const common = {
   allowGlobals,
   buildType,
@@ -662,16 +720,19 @@ const common = {
   disableCrashOnUnhandledRejection,
   expectsError,
   expectWarning,
+  gcUntil,
   getArrayBufferViews,
   getBufferSources,
   getCallSite,
   getTTYfd,
   hasIntl,
   hasCrypto,
+  hasQuic,
   hasMultiLocalhost,
   invalidArgTypeHelper,
   isAIX,
   isAlive,
+  isDumbTerminal,
   isFreeBSD,
   isLinux,
   isMainThread,
@@ -683,15 +744,17 @@ const common = {
   mustCall,
   mustCallAtLeast,
   mustNotCall,
+  mustSucceed,
   nodeProcessAborted,
   PIPE,
   platformTimeout,
   printSkipMessage,
   pwdCommand,
-  rootDir,
+  requireNoPackageJSONAbove,
   runWithInvalidFD,
   skip,
   skipIf32Bits,
+  skipIfDumbTerminal,
   skipIfEslintMissing,
   skipIfInspectorDisabled,
   skipIfWorker,
@@ -761,8 +824,6 @@ const common = {
 
     return localhostIPv4;
   },
-
-  get localhostIPv6() { return '::1'; },
 
   // opensslCli defined lazily to reduce overhead of spawnSync
   get opensslCli() {

@@ -54,12 +54,12 @@ from [nghttp2.org][] or built from source.
 ### Benchmark Analysis Requirements
 
 To analyze the results, `R` should be installed. Use one of the available
-package managers or download it from https://www.r-project.org/.
+package managers or download it from <https://www.r-project.org/>.
 
 The R packages `ggplot2` and `plyr` are also used and can be installed using
 the R REPL.
 
-```R
+```console
 $ R
 install.packages("ggplot2")
 install.packages("plyr")
@@ -68,10 +68,10 @@ install.packages("plyr")
 In the event that a message is reported stating that a CRAN mirror must be
 selected first, specify a mirror by adding in the repo parameter.
 
-If we used the "http://cran.us.r-project.org" mirror, it could look something
+If we used the "<http://cran.us.r-project.org>" mirror, it could look something
 like this:
 
-```R
+```r
 install.packages("ggplot2", repo="http://cran.us.r-project.org")
 ```
 
@@ -551,8 +551,8 @@ Supported options keys are:
   benchmarker
 
 [autocannon]: https://github.com/mcollina/autocannon
-[wrk]: https://github.com/wg/wrk
-[t-test]: https://en.wikipedia.org/wiki/Student%27s_t-test#Equal_or_unequal_sample_sizes.2C_unequal_variances
+[benchmark-ci]: https://github.com/nodejs/benchmarking/blob/master/docs/core_benchmarks.md
 [git-for-windows]: https://git-scm.com/download/win
 [nghttp2.org]: https://nghttp2.org
-[benchmark-ci]: https://github.com/nodejs/benchmarking/blob/master/docs/core_benchmarks.md
+[t-test]: https://en.wikipedia.org/wiki/Student%27s_t-test#Equal_or_unequal_sample_sizes.2C_unequal_variances
+[wrk]: https://github.com/wg/wrk

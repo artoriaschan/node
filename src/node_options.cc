@@ -18,7 +18,6 @@ using v8::Local;
 using v8::Map;
 using v8::Number;
 using v8::Object;
-using v8::String;
 using v8::Undefined;
 using v8::Value;
 
@@ -93,20 +92,7 @@ void EnvironmentOptions::CheckOptions(std::vector<std::string>* errors) {
     }
   }
 
-  if (!es_module_specifier_resolution.empty()) {
-    if (!experimental_specifier_resolution.empty()) {
-      errors->push_back(
-        "bad option: cannot use --es-module-specifier-resolution"
-        " and --experimental-specifier-resolution at the same time");
-    } else {
-      experimental_specifier_resolution = es_module_specifier_resolution;
-      if (experimental_specifier_resolution != "node" &&
-          experimental_specifier_resolution != "explicit") {
-        errors->push_back(
-          "invalid value for --es-module-specifier-resolution");
-      }
-    }
-  } else if (!experimental_specifier_resolution.empty()) {
+  if (!experimental_specifier_resolution.empty()) {
     if (experimental_specifier_resolution != "node" &&
         experimental_specifier_resolution != "explicit") {
       errors->push_back(
@@ -119,6 +105,8 @@ void EnvironmentOptions::CheckOptions(std::vector<std::string>* errors) {
   }
 
   if (!unhandled_rejections.empty() &&
+      unhandled_rejections != "warn-with-error-code" &&
+      unhandled_rejections != "throw" &&
       unhandled_rejections != "strict" &&
       unhandled_rejections != "warn" &&
       unhandled_rejections != "none") {
@@ -128,6 +116,10 @@ void EnvironmentOptions::CheckOptions(std::vector<std::string>* errors) {
   if (tls_min_v1_3 && tls_max_v1_2) {
     errors->push_back("either --tls-min-v1.3 or --tls-max-v1.2 can be "
                       "used, not both");
+  }
+
+  if (heap_snapshot_near_heap_limit < 0) {
+    errors->push_back("--heap-snapshot-near-heap-limit must not be negative");
   }
 
 #if HAVE_INSPECTOR
@@ -145,6 +137,10 @@ void EnvironmentOptions::CheckOptions(std::vector<std::string>* errors) {
     }
   }
 
+  if (cpu_prof && cpu_prof_dir.empty() && !diagnostic_dir.empty()) {
+      cpu_prof_dir = diagnostic_dir;
+    }
+
   if (!heap_prof) {
     if (!heap_prof_name.empty()) {
       errors->push_back("--heap-prof-name must be used with --heap-prof");
@@ -158,6 +154,11 @@ void EnvironmentOptions::CheckOptions(std::vector<std::string>* errors) {
       errors->push_back("--heap-prof-interval must be used with --heap-prof");
     }
   }
+
+  if (heap_prof && heap_prof_dir.empty() && !diagnostic_dir.empty()) {
+    heap_prof_dir = diagnostic_dir;
+  }
+
   debug_options_.CheckOptions(errors);
 #endif  // HAVE_INSPECTOR
 }
@@ -271,10 +272,21 @@ DebugOptionsParser::DebugOptionsParser() {
 }
 
 EnvironmentOptionsParser::EnvironmentOptionsParser() {
+  AddOption("--conditions",
+            "additional user conditions for conditional exports and imports",
+            &EnvironmentOptions::conditions,
+            kAllowedInEnvironment);
+  AddOption("--diagnostic-dir",
+            "set dir for all output files"
+            " (default: current working directory)",
+            &EnvironmentOptions::diagnostic_dir,
+            kAllowedInEnvironment);
   AddOption("--enable-source-maps",
             "experimental Source Map V3 support",
             &EnvironmentOptions::enable_source_maps,
             kAllowedInEnvironment);
+  AddOption("--experimental-abortcontroller", "",
+            NoOp{}, kAllowedInEnvironment);
   AddOption("--experimental-json-modules",
             "experimental JSON interop support for the ES Module loader",
             &EnvironmentOptions::experimental_json_modules,
@@ -285,7 +297,7 @@ EnvironmentOptionsParser::EnvironmentOptionsParser() {
             kAllowedInEnvironment);
   AddAlias("--loader", "--experimental-loader");
   AddOption("--experimental-modules",
-            "experimental modules features",
+            "",
             &EnvironmentOptions::experimental_modules,
             kAllowedInEnvironment);
   AddOption("--experimental-wasm-modules",
@@ -333,6 +345,12 @@ EnvironmentOptionsParser::EnvironmentOptionsParser() {
             "Generate heap snapshot on specified signal",
             &EnvironmentOptions::heap_snapshot_signal,
             kAllowedInEnvironment);
+  AddOption("--heapsnapshot-near-heap-limit",
+            "Generate heap snapshots whenever V8 is approaching "
+            "the heap limit. No more than the specified number of "
+            "heap snapshots will be generated.",
+            &EnvironmentOptions::heap_snapshot_near_heap_limit,
+            kAllowedInEnvironment);
   AddOption("--http-parser", "", NoOp{}, kAllowedInEnvironment);
   AddOption("--insecure-http-parser",
             "use an insecure HTTP parser that accepts invalid HTTP headers",
@@ -347,10 +365,8 @@ EnvironmentOptionsParser::EnvironmentOptionsParser() {
             "either 'explicit' (default) or 'node'",
             &EnvironmentOptions::experimental_specifier_resolution,
             kAllowedInEnvironment);
-  AddOption("--es-module-specifier-resolution",
-            "",
-            &EnvironmentOptions::es_module_specifier_resolution,
-            kAllowedInEnvironment);
+  AddAlias("--es-module-specifier-resolution",
+           "--experimental-specifier-resolution");
   AddOption("--no-deprecation",
             "silence deprecation warnings",
             &EnvironmentOptions::no_deprecation,
@@ -379,6 +395,9 @@ EnvironmentOptionsParser::EnvironmentOptionsParser() {
             "preserve symbolic links when resolving the main module",
             &EnvironmentOptions::preserve_symlinks_main,
             kAllowedInEnvironment);
+  AddOption("--prof",
+            "Generate V8 profiler output.",
+            V8Option{});
   AddOption("--prof-process",
             "process V8 profiler output generated using --prof",
             &EnvironmentOptions::prof_process);
@@ -435,6 +454,10 @@ EnvironmentOptionsParser::EnvironmentOptionsParser() {
             "throw an exception on deprecations",
             &EnvironmentOptions::throw_deprecation,
             kAllowedInEnvironment);
+  AddOption("--trace-atomics-wait",
+            "trace Atomics.wait() operations",
+            &EnvironmentOptions::trace_atomics_wait,
+            kAllowedInEnvironment);
   AddOption("--trace-deprecation",
             "show stack traces on deprecations",
             &EnvironmentOptions::trace_deprecation,
@@ -464,6 +487,10 @@ EnvironmentOptionsParser::EnvironmentOptionsParser() {
             "define unhandled rejections behavior. Options are 'strict' (raise "
             "an error), 'warn' (enforce warnings) or 'none' (silence warnings)",
             &EnvironmentOptions::unhandled_rejections,
+            kAllowedInEnvironment);
+  AddOption("--verify-base-objects",
+            "", /* undocumented, only for debugging */
+            &EnvironmentOptions::verify_base_objects,
             kAllowedInEnvironment);
 
   AddOption("--check",
@@ -582,10 +609,6 @@ PerIsolateOptionsParser::PerIsolateOptionsParser(
             "generate diagnostic report on uncaught exceptions",
             &PerIsolateOptions::report_uncaught_exception,
             kAllowedInEnvironment);
-  AddOption("--report-compact",
-            "output compact single-line JSON",
-            &PerIsolateOptions::report_compact,
-            kAllowedInEnvironment);
   AddOption("--report-on-signal",
             "generate diagnostic report upon receiving signals",
             &PerIsolateOptions::report_on_signal,
@@ -596,16 +619,15 @@ PerIsolateOptionsParser::PerIsolateOptionsParser(
             &PerIsolateOptions::report_signal,
             kAllowedInEnvironment);
   Implies("--report-signal", "--report-on-signal");
-  AddOption("--report-filename",
-            "define custom report file name."
-            " (default: YYYYMMDD.HHMMSS.PID.SEQUENCE#.txt)",
-            &PerIsolateOptions::report_filename,
+
+  AddOption("--experimental-top-level-await",
+            "",
+            &PerIsolateOptions::experimental_top_level_await,
             kAllowedInEnvironment);
-  AddOption("--report-directory",
-            "define custom report pathname."
-            " (default: current working directory of Node.js process)",
-            &PerIsolateOptions::report_directory,
-            kAllowedInEnvironment);
+  AddOption("--harmony-top-level-await", "", V8Option{});
+  Implies("--experimental-top-level-await", "--harmony-top-level-await");
+  Implies("--harmony-top-level-await", "--experimental-top-level-await");
+  ImpliesNot("--no-harmony-top-level-await", "--experimental-top-level-await");
 
   Insert(eop, &PerIsolateOptions::get_per_env_options);
 }
@@ -663,6 +685,21 @@ PerProcessOptionsParser::PerProcessOptionsParser(
   AddOption("--v8-options",
             "print V8 command line options",
             &PerProcessOptions::print_v8_help);
+  AddOption("--report-compact",
+            "output compact single-line JSON",
+            &PerProcessOptions::report_compact,
+            kAllowedInEnvironment);
+  AddOption("--report-dir",
+            "define custom report pathname."
+            " (default: current working directory)",
+            &PerProcessOptions::report_directory,
+            kAllowedInEnvironment);
+  AddAlias("--report-directory", "--report-dir");
+  AddOption("--report-filename",
+            "define custom report file name."
+            " (default: YYYYMMDD.HHMMSS.PID.SEQUENCE#.txt)",
+            &PerProcessOptions::report_filename,
+            kAllowedInEnvironment);
   AddOption("--report-on-fatalerror",
               "generate diagnostic report on fatal (internal) errors",
               &PerProcessOptions::report_on_fatalerror,
@@ -738,6 +775,12 @@ PerProcessOptionsParser::PerProcessOptionsParser(
             kAllowedInEnvironment);
 
   Insert(iop, &PerProcessOptions::get_per_isolate_options);
+
+  AddOption("--node-memory-debug",
+            "Run with extra debug checks for memory leaks in Node.js itself",
+            NoOp{}, kAllowedInEnvironment);
+  Implies("--node-memory-debug", "--debug-arraybuffer-allocations");
+  Implies("--node-memory-debug", "--verify-base-objects");
 }
 
 inline std::string RemoveBrackets(const std::string& host) {
@@ -817,7 +860,8 @@ std::string GetBashCompletion() {
          "    return 0\n"
          "  fi\n"
          "}\n"
-         "complete -F _node_complete node node_g";
+         "complete -o filenames -o nospace -o bashdefault "
+         "-F _node_complete node node_g";
   return out.str();
 }
 
@@ -960,6 +1004,12 @@ void Initialize(Local<Object> target,
   target
       ->Set(
           context, FIXED_ONE_BYTE_STRING(isolate, "envSettings"), env_settings)
+      .Check();
+
+  target
+      ->Set(context,
+            FIXED_ONE_BYTE_STRING(env->isolate(), "shouldNotRegisterESMLoader"),
+            Boolean::New(isolate, env->should_not_register_esm_loader()))
       .Check();
 
   Local<Object> types = Object::New(isolate);

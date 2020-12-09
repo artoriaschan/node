@@ -35,7 +35,7 @@ function buildCurrentResource(getServe) {
 
   function getCLS() {
     const resource = executionAsyncResource();
-    if (resource === null || !resource[cls]) {
+    if (!resource[cls]) {
       return null;
     }
     return resource[cls].state;
@@ -43,9 +43,6 @@ function buildCurrentResource(getServe) {
 
   function setCLS(state) {
     const resource = executionAsyncResource();
-    if (resource === null) {
-      return;
-    }
     if (!resource[cls]) {
       resource[cls] = { state };
     } else {
@@ -104,7 +101,7 @@ function buildDestroy(getServe) {
 function buildAsyncLocalStorage(getServe) {
   const asyncLocalStorage = new AsyncLocalStorage();
   const server = createServer((req, res) => {
-    asyncLocalStorage.runSyncAndReturn({}, () => {
+    asyncLocalStorage.run({}, () => {
       getServe(getCLS, setCLS)(req, res);
     });
   });
@@ -116,11 +113,17 @@ function buildAsyncLocalStorage(getServe) {
 
   function getCLS() {
     const store = asyncLocalStorage.getStore();
+    if (store === undefined) {
+      return null;
+    }
     return store.state;
   }
 
   function setCLS(state) {
     const store = asyncLocalStorage.getStore();
+    if (store === undefined) {
+      return;
+    }
     store.state = state;
   }
 
@@ -135,6 +138,7 @@ function getServeAwait(getCLS, setCLS) {
     setCLS(Math.random());
     await sleep(10);
     await read(__filename);
+    if (res.destroyed) return;
     res.setHeader('content-type', 'application/json');
     res.end(JSON.stringify({ cls: getCLS() }));
   };
@@ -145,6 +149,7 @@ function getServeCallbacks(getCLS, setCLS) {
     setCLS(Math.random());
     setTimeout(() => {
       readFile(__filename, () => {
+        if (res.destroyed) return;
         res.setHeader('content-type', 'application/json');
         res.end(JSON.stringify({ cls: getCLS() }));
       });
