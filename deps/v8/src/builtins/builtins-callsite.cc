@@ -53,6 +53,22 @@ BUILTIN(CallSitePrototypeGetColumnNumber) {
   return PositiveNumberOrNull(it.Frame()->GetColumnNumber(), isolate);
 }
 
+BUILTIN(CallSitePrototypeGetEnclosingColumnNumber) {
+  HandleScope scope(isolate);
+  CHECK_CALLSITE(recv, "getEnclosingColumnNumber");
+  FrameArrayIterator it(isolate, GetFrameArray(isolate, recv),
+                        GetFrameIndex(isolate, recv));
+  return PositiveNumberOrNull(it.Frame()->GetEnclosingColumnNumber(), isolate);
+}
+
+BUILTIN(CallSitePrototypeGetEnclosingLineNumber) {
+  HandleScope scope(isolate);
+  CHECK_CALLSITE(recv, "getEnclosingLineNumber");
+  FrameArrayIterator it(isolate, GetFrameArray(isolate, recv),
+                        GetFrameIndex(isolate, recv));
+  return PositiveNumberOrNull(it.Frame()->GetEnclosingLineNumber(), isolate);
+}
+
 BUILTIN(CallSitePrototypeGetEvalOrigin) {
   HandleScope scope(isolate);
   CHECK_CALLSITE(recv, "getEvalOrigin");
@@ -76,7 +92,11 @@ BUILTIN(CallSitePrototypeGetFunction) {
                         GetFrameIndex(isolate, recv));
 
   StackFrameBase* frame = it.Frame();
-  if (frame->IsStrict()) return ReadOnlyRoots(isolate).undefined_value();
+  if (frame->IsStrict() ||
+      (frame->GetFunction()->IsJSFunction() &&
+       JSFunction::cast(*frame->GetFunction()).shared().is_toplevel())) {
+    return ReadOnlyRoots(isolate).undefined_value();
+  }
 
   isolate->CountUsage(v8::Isolate::kCallSiteAPIGetFunctionSloppyCall);
 

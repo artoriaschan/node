@@ -147,8 +147,8 @@ assert.strictEqual(
   "[String: 'hello'] { [length]: 5, [Symbol(foo)]: 123 }"
 );
 
-assert.strictEqual(util.inspect((new JSStream())._externalStream),
-                   '[External]');
+assert.match(util.inspect((new JSStream())._externalStream),
+             /^\[External: [0-9a-f]+\]$/);
 
 {
   const regexp = /regexp/;
@@ -583,9 +583,9 @@ assert.strictEqual(util.inspect(-5e-324), '-5e-324');
 {
   let obj = vm.runInNewContext('(function(){return {}})()', {});
   assert.strictEqual(util.inspect(obj), '{}');
-  obj = vm.runInNewContext('var m=new Map();m.set(1,2);m', {});
+  obj = vm.runInNewContext('const m=new Map();m.set(1,2);m', {});
   assert.strictEqual(util.inspect(obj), 'Map(1) { 1 => 2 }');
-  obj = vm.runInNewContext('var s=new Set();s.add(1);s.add(2);s', {});
+  obj = vm.runInNewContext('const s=new Set();s.add(1);s.add(2);s', {});
   assert.strictEqual(util.inspect(obj), 'Set(2) { 1, 2 }');
   obj = vm.runInNewContext('fn=function(){};new Promise(fn,fn)', {});
   assert.strictEqual(util.inspect(obj), 'Promise { <pending> }');
@@ -695,6 +695,28 @@ assert.strictEqual(util.inspect(-5e-324), '-5e-324');
   );
 
   Error.stackTraceLimit = tmp;
+}
+
+// Prevent enumerable error properties from being printed.
+{
+  let err = new Error();
+  err.message = 'foobar';
+  let out = util.inspect(err).split('\n');
+  assert.strictEqual(out[0], 'Error: foobar');
+  assert(out[out.length - 1].startsWith('    at '));
+  // Reset the error, the stack is otherwise not recreated.
+  err = new Error();
+  err.message = 'foobar';
+  err.name = 'Unique';
+  Object.defineProperty(err, 'stack', { value: err.stack, enumerable: true });
+  out = util.inspect(err).split('\n');
+  assert.strictEqual(out[0], 'Unique: foobar');
+  assert(out[out.length - 1].startsWith('    at '));
+  err.name = 'Baz';
+  out = util.inspect(err).split('\n');
+  assert.strictEqual(out[0], 'Unique: foobar');
+  assert.strictEqual(out[out.length - 2], "  name: 'Baz'");
+  assert.strictEqual(out[out.length - 1], '}');
 }
 
 // Doesn't capture stack trace.
@@ -1951,6 +1973,88 @@ assert.strictEqual(util.inspect('"\'${a}'), "'\"\\'${a}'");
   );
 });
 
+// Verify that classes are properly inspected.
+[
+  /* eslint-disable spaced-comment, no-multi-spaces, brace-style */
+  // The whitespace is intentional.
+  [class   { }, '[class (anonymous)]'],
+  [class extends Error { log() {} }, '[class (anonymous) extends Error]'],
+  [class A { constructor(a) { this.a = a; } log() { return this.a; } },
+   '[class A]'],
+  [class
+  // Random { // comments /* */ are part of the toString() result
+  /* eslint-disable-next-line space-before-blocks */
+  äß/**/extends/*{*/TypeError{}, '[class äß extends TypeError]'],
+  /* The whitespace and new line is intended! */
+  // Foobar !!!
+  [class X   extends /****/ Error
+  // More comments
+  {}, '[class X extends Error]']
+  /* eslint-enable spaced-comment, no-multi-spaces, brace-style */
+].forEach(([clazz, string]) => {
+  const inspected = util.inspect(clazz);
+  assert.strictEqual(inspected, string);
+  Object.defineProperty(clazz, Symbol.toStringTag, {
+    value: 'Woohoo'
+  });
+  const parts = inspected.slice(0, -1).split(' ');
+  const [, name, ...rest] = parts;
+  rest.unshift('[Woohoo]');
+  if (rest.length) {
+    rest[rest.length - 1] += ']';
+  }
+  assert.strictEqual(
+    util.inspect(clazz),
+    ['[class', name, ...rest].join(' ')
+  );
+  if (rest.length) {
+    rest[rest.length - 1] = rest[rest.length - 1].slice(0, -1);
+    rest.length = 1;
+  }
+  Object.setPrototypeOf(clazz, null);
+  assert.strictEqual(
+    util.inspect(clazz),
+    ['[class', name, ...rest, 'extends [null prototype]]'].join(' ')
+  );
+  Object.defineProperty(clazz, 'name', { value: 'Foo' });
+  const res = ['[class', 'Foo', ...rest, 'extends [null prototype]]'].join(' ');
+  assert.strictEqual(util.inspect(clazz), res);
+  clazz.foo = true;
+  assert.strictEqual(util.inspect(clazz), `${res} { foo: true }`);
+});
+
+// "class" properties should not be detected as "class".
+{
+  // eslint-disable-next-line space-before-function-paren
+  let obj = { class () {} };
+  assert.strictEqual(
+    util.inspect(obj),
+    '{ class: [Function: class] }'
+  );
+  obj = { class: () => {} };
+  assert.strictEqual(
+    util.inspect(obj),
+    '{ class: [Function: class] }'
+  );
+  obj = { ['class Foo {}']() {} };
+  assert.strictEqual(
+    util.inspect(obj),
+    "{ 'class Foo {}': [Function: class Foo {}] }"
+  );
+  function Foo() {}
+  Object.defineProperty(Foo, 'toString', { value: () => 'class Foo {}' });
+  assert.strictEqual(
+    util.inspect(Foo),
+    '[Function: Foo]'
+  );
+  function fn() {}
+  Object.defineProperty(fn, 'name', { value: 'class Foo {}' });
+  assert.strictEqual(
+    util.inspect(fn),
+    '[Function: class Foo {}]'
+  );
+}
+
 // Verify that throwing in valueOf and toString still produces nice results.
 [
   [new String(55), "[String: '55']"],
@@ -2141,6 +2245,12 @@ assert.strictEqual(
     assert.deepStrictEqual(inspect.colors[bgColor], [40 + i, 49]);
     assert.deepStrictEqual(inspect.colors[`${bgColor}Bright`], [100 + i, 49]);
   });
+
+  // Unknown colors are handled gracefully:
+  const stringStyle = inspect.styles.string;
+  inspect.styles.string = 'UNKNOWN';
+  assert.strictEqual(inspect('foobar', { colors: true }), "'foobar'");
+  inspect.styles.string = stringStyle;
 }
 
 assert.strictEqual(
@@ -2606,16 +2716,16 @@ assert.strictEqual(
   const stack = [
     'TypedError: Wonderful message!',
     '    at A.<anonymous> (/test/node_modules/foo/node_modules/bar/baz.js:2:7)',
-    '    at Module._compile (internal/modules/cjs/loader.js:827:30)',
-    '    at Fancy (vm.js:697:32)',
+    '    at Module._compile (node:internal/modules/cjs/loader:827:30)',
+    '    at Fancy (node:vm:697:32)',
     // This file is not an actual Node.js core file.
-    '    at tryModuleLoad (internal/modules/cjs/foo.js:629:12)',
-    '    at Function.Module._load (internal/modules/cjs/loader.js:621:3)',
+    '    at tryModuleLoad (node:internal/modules/cjs/foo:629:12)',
+    '    at Function.Module._load (node:internal/modules/cjs/loader:621:3)',
     // This file is not an actual Node.js core file.
-    '    at Module.require [as weird/name] (internal/aaaaaa/loader.js:735:19)',
-    '    at require (internal/modules/cjs/helpers.js:14:16)',
+    '    at Module.require [as weird/name] (node:internal/aaaaa/loader:735:19)',
+    '    at require (node:internal/modules/cjs/helpers:14:16)',
     '    at /test/test-util-inspect.js:2239:9',
-    '    at getActual (assert.js:592:5)'
+    '    at getActual (node:assert:592:5)'
   ];
   const isNodeCoreFile = [
     false, false, true, true, false, true, false, true, false, true
@@ -2723,6 +2833,37 @@ assert.strictEqual(
     '{ \x1B[2mabc: \x1B[33mtrue\x1B[39m\x1B[22m, ' +
       '\x1B[2mdef: \x1B[33m5\x1B[39m\x1B[22m }'
   );
+
+  assert.strictEqual(
+    inspect(Object.getPrototypeOf(bar), { showHidden: true, getters: true }),
+    '<ref *1> Foo [Map] {\n' +
+    '    [constructor]: [class Bar extends Foo] {\n' +
+    '      [length]: 0,\n' +
+    '      [prototype]: [Circular *1],\n' +
+    "      [name]: 'Bar',\n" +
+    '      [Symbol(Symbol.species)]: [Getter: <Inspection threw ' +
+      "(Symbol.prototype.toString requires that 'this' be a Symbol)>]\n" +
+    '    },\n' +
+    "    [xyz]: [Getter: 'YES!'],\n" +
+    '    [Symbol(nodejs.util.inspect.custom)]: ' +
+      '[Function: [nodejs.util.inspect.custom]] {\n' +
+    '      [length]: 0,\n' +
+    "      [name]: '[nodejs.util.inspect.custom]'\n" +
+    '    },\n' +
+    '    [abc]: [Getter: true],\n' +
+    '    [def]: [Getter/Setter: false]\n' +
+    '  }'
+  );
+
+  assert.strictEqual(
+    inspect(Object.getPrototypeOf(bar)),
+    'Foo [Map] {}'
+  );
+
+  assert.strictEqual(
+    inspect(Object.getPrototypeOf(new Foo())),
+    'Map {}'
+  );
 }
 
 // Test changing util.inspect.colors colors and aliases.
@@ -2756,4 +2897,149 @@ assert.strictEqual(
   const undetectable = vm.runInThisContext('%GetUndetectable()');
   v8.setFlagsFromString('--no-allow-natives-syntax');
   assert.strictEqual(inspect(undetectable), '{}');
+}
+
+{
+  const x = 'a'.repeat(1e6);
+  assert(util.inspect(x).endsWith('... 990000 more characters'));
+  assert.strictEqual(
+    util.inspect(x, { maxStringLength: 4 }),
+    "'aaaa'... 999996 more characters"
+  );
+  assert.match(util.inspect(x, { maxStringLength: null }), /a'$/);
+}
+
+{
+  // Verify that util.inspect() invokes custom inspect functions on objects
+  // from other vm.Contexts but does not pass data from its own Context to that
+  // function.
+  const target = vm.runInNewContext(`
+    ({
+      [Symbol.for('nodejs.util.inspect.custom')](depth, ctx) {
+        this.depth = depth;
+        this.ctx = ctx;
+        try {
+          this.stylized = ctx.stylize('🐈');
+        } catch (e) {
+          this.stylizeException = e;
+        }
+        return this.stylized;
+      }
+    })
+  `, Object.create(null));
+  assert.strictEqual(target.ctx, undefined);
+
+  {
+    // Subtest 1: Just try to inspect the object with default options.
+    assert.strictEqual(util.inspect(target), '🐈');
+    assert.strictEqual(typeof target.ctx, 'object');
+    const objectGraph = fullObjectGraph(target);
+    assert(!objectGraph.has(Object));
+    assert(!objectGraph.has(Function));
+  }
+
+  {
+    // Subtest 2: Use a stylize function that returns a non-primitive.
+    const output = util.inspect(target, {
+      stylize: common.mustCall((str) => {
+        return {};
+      })
+    });
+    assert.strictEqual(output, '[object Object]');
+    assert.strictEqual(typeof target.ctx, 'object');
+    const objectGraph = fullObjectGraph(target);
+    assert(!objectGraph.has(Object));
+    assert(!objectGraph.has(Function));
+  }
+
+  {
+    // Subtest 3: Use a stylize function that throws an exception.
+    const output = util.inspect(target, {
+      stylize: common.mustCall((str) => {
+        throw new Error('oops');
+      })
+    });
+    assert.strictEqual(output, '🐈');
+    assert.strictEqual(typeof target.ctx, 'object');
+    const objectGraph = fullObjectGraph(target);
+    assert(!objectGraph.has(Object));
+    assert(!objectGraph.has(Function));
+  }
+
+  function fullObjectGraph(value) {
+    const graph = new Set([value]);
+
+    for (const entry of graph) {
+      if ((typeof entry !== 'object' && typeof entry !== 'function') ||
+          entry === null) {
+        continue;
+      }
+
+      graph.add(Object.getPrototypeOf(entry));
+      const descriptors = Object.values(
+        Object.getOwnPropertyDescriptors(entry));
+      for (const descriptor of descriptors) {
+        graph.add(descriptor.value);
+        graph.add(descriptor.set);
+        graph.add(descriptor.get);
+      }
+    }
+
+    return graph;
+  }
+
+  // Consistency check.
+  assert(fullObjectGraph(global).has(Function.prototype));
+}
+
+{
+  // Confirm that own constructor value displays correctly.
+
+  function Fhqwhgads() {}
+
+  const sterrance = new Fhqwhgads();
+  sterrance.constructor = Fhqwhgads;
+
+  assert.strictEqual(
+    util.inspect(sterrance, { showHidden: true }),
+    'Fhqwhgads {\n' +
+      '  constructor: <ref *1> [Function: Fhqwhgads] {\n' +
+      '    [length]: 0,\n' +
+      "    [name]: 'Fhqwhgads',\n" +
+      '    [prototype]: { [constructor]: [Circular *1] }\n' +
+      '  }\n' +
+      '}'
+  );
+}
+
+{
+  // Confirm null prototype of generator prototype displays as expected.
+
+  function getProtoOfProto() {
+    return Object.getPrototypeOf(Object.getPrototypeOf(function* () {}));
+  }
+
+  function* generator() {}
+
+  const generatorPrototype = Object.getPrototypeOf(generator);
+  const originalProtoOfProto = Object.getPrototypeOf(generatorPrototype);
+  assert.strictEqual(getProtoOfProto(), originalProtoOfProto);
+  Object.setPrototypeOf(generatorPrototype, null);
+  assert.notStrictEqual(getProtoOfProto, originalProtoOfProto);
+
+  // This is the actual test. The other assertions in this block are about
+  // making sure the test is set up correctly and isn't polluting other tests.
+  assert.strictEqual(
+    util.inspect(generator, { showHidden: true }),
+    '[GeneratorFunction: generator] {\n' +
+    '  [length]: 0,\n' +
+    "  [name]: 'generator',\n" +
+    "  [prototype]: Object [Generator] { [Symbol(Symbol.toStringTag)]: 'Generator' },\n" + // eslint-disable-line max-len
+    "  [Symbol(Symbol.toStringTag)]: 'GeneratorFunction'\n" +
+    '}'
+  );
+
+  // Reset so we don't pollute other tests
+  Object.setPrototypeOf(generatorPrototype, originalProtoOfProto);
+  assert.strictEqual(getProtoOfProto(), originalProtoOfProto);
 }

@@ -2,6 +2,7 @@
 #include "debug_utils-inl.h"
 #include "memory_tracker-inl.h"
 #include "node_errors.h"
+#include "node_external_reference.h"
 #include "node_buffer.h"
 #include "node_options-inl.h"
 #include "node_perf.h"
@@ -16,7 +17,6 @@ using node::kAllowedInEnvironment;
 using node::kDisallowedInEnvironment;
 using v8::Array;
 using v8::ArrayBuffer;
-using v8::BackingStore;
 using v8::Boolean;
 using v8::Context;
 using v8::Float64Array;
@@ -40,6 +40,8 @@ using v8::Value;
 
 namespace node {
 namespace worker {
+
+constexpr double kMB = 1024 * 1024;
 
 Worker::Worker(Environment* env,
                Local<Object> wrap,
@@ -95,8 +97,6 @@ bool Worker::is_stopped() const {
 void Worker::UpdateResourceConstraints(ResourceConstraints* constraints) {
   constraints->set_stack_limit(reinterpret_cast<uint32_t*>(stack_base_));
 
-  constexpr double kMB = 1024 * 1024;
-
   if (resource_limits_[kMaxYoungGenerationSizeMb] > 0) {
     constraints->set_max_young_generation_size_in_bytes(
         resource_limits_[kMaxYoungGenerationSizeMb] * kMB);
@@ -133,12 +133,11 @@ class WorkerThreadData {
     if (ret != 0) {
       char err_buf[128];
       uv_err_name_r(ret, err_buf, sizeof(err_buf));
-      w->custom_error_ = "ERR_WORKER_INIT_FAILED";
-      w->custom_error_str_ = err_buf;
-      w->loop_init_failed_ = true;
-      w->stopped_ = true;
+      w->Exit(1, "ERR_WORKER_INIT_FAILED", err_buf);
       return;
     }
+    loop_init_failed_ = false;
+    uv_loop_configure(&loop_, UV_METRICS_IDLE_TIME);
 
     std::shared_ptr<ArrayBufferAllocator> allocator =
         ArrayBufferAllocator::Create();
@@ -150,9 +149,9 @@ class WorkerThreadData {
 
     Isolate* isolate = Isolate::Allocate();
     if (isolate == nullptr) {
-      w->custom_error_ = "ERR_WORKER_OUT_OF_MEMORY";
-      w->custom_error_str_ = "Failed to create new Isolate";
-      w->stopped_ = true;
+      // TODO(addaleax): This should be ERR_WORKER_INIT_FAILED,
+      // ERR_WORKER_OUT_OF_MEMORY is for reaching the per-Worker heap limit.
+      w->Exit(1, "ERR_WORKER_OUT_OF_MEMORY", "Failed to create new Isolate");
       return;
     }
 
@@ -160,6 +159,9 @@ class WorkerThreadData {
     Isolate::Initialize(isolate, params);
     SetIsolateUpForNode(isolate);
 
+    // Be sure it's called before Environment::InitializeDiagnostics()
+    // so that this callback stays when the callback of
+    // --heapsnapshot-near-heap-limit gets is popped.
     isolate->AddNearHeapLimitCallback(Worker::NearHeapLimit, w);
 
     {
@@ -178,6 +180,8 @@ class WorkerThreadData {
       if (w_->per_isolate_opts_)
         isolate_data_->set_options(std::move(w_->per_isolate_opts_));
       isolate_data_->set_worker_context(w_);
+      isolate_data_->max_young_gen_size =
+          params.constraints.max_young_generation_size_in_bytes();
     }
 
     Mutex::ScopedLock lock(w_->mutex_);
@@ -194,6 +198,7 @@ class WorkerThreadData {
     }
 
     if (isolate != nullptr) {
+      CHECK(!loop_init_failed_);
       bool platform_finished = false;
 
       isolate_data_.reset();
@@ -212,18 +217,20 @@ class WorkerThreadData {
 
       // Wait until the platform has cleaned up all relevant resources.
       while (!platform_finished) {
-        CHECK(!w_->loop_init_failed_);
         uv_run(&loop_, UV_RUN_ONCE);
       }
     }
-    if (!w_->loop_init_failed_) {
+    if (!loop_init_failed_) {
       CheckedUvLoopClose(&loop_);
     }
   }
 
+  bool loop_is_usable() const { return !loop_init_failed_; }
+
  private:
   Worker* const w_;
   uv_loop_t loop_;
+  bool loop_init_failed_ = true;
   DeleteFnPtr<IsolateData, FreeIsolateData> isolate_data_;
 
   friend class Worker;
@@ -232,9 +239,7 @@ class WorkerThreadData {
 size_t Worker::NearHeapLimit(void* data, size_t current_heap_limit,
                              size_t initial_heap_limit) {
   Worker* worker = static_cast<Worker*>(data);
-  worker->custom_error_ = "ERR_WORKER_OUT_OF_MEMORY";
-  worker->custom_error_str_ = "JS heap out of memory";
-  worker->Exit(1);
+  worker->Exit(1, "ERR_WORKER_OUT_OF_MEMORY", "JS heap out of memory");
   // Give the current GC some extra leeway to let it finish rather than
   // crash hard. We are not going to perform further allocations anyway.
   constexpr size_t kExtraHeapAllowance = 16 * 1024 * 1024;
@@ -253,7 +258,7 @@ void Worker::Run() {
 
   WorkerThreadData data(this);
   if (isolate_ == nullptr) return;
-  CHECK(!data.w_->loop_init_failed_);
+  CHECK(data.loop_is_usable());
 
   Debug(this, "Starting worker with id %llu", thread_id_.id);
   {
@@ -263,6 +268,11 @@ void Worker::Run() {
 
     DeleteFnPtr<Environment, FreeEnvironment> env_;
     auto cleanup_env = OnScopeLeave([&]() {
+      // TODO(addaleax): This call is harmless but should not be necessary.
+      // Figure out why V8 is raising a DCHECK() here without it
+      // (in test/parallel/test-async-hooks-worker-asyncfn-terminate-4.js).
+      isolate_->CancelTerminateExecution();
+
       if (!env_) return;
       env_->set_can_call_into_js(false);
 
@@ -272,10 +282,6 @@ void Worker::Run() {
         this->env_ = nullptr;
       }
 
-      // TODO(addaleax): Try moving DisallowJavascriptExecutionScope into
-      // FreeEnvironment().
-      Isolate::DisallowJavascriptExecutionScope disallow_js(isolate_,
-          Isolate::DisallowJavascriptExecutionScope::THROW_ON_FAILURE);
       env_.reset();
     });
 
@@ -291,8 +297,9 @@ void Worker::Run() {
         TryCatch try_catch(isolate_);
         context = NewContext(isolate_);
         if (context.IsEmpty()) {
-          custom_error_ = "ERR_WORKER_OUT_OF_MEMORY";
-          custom_error_str_ = "Failed to create new Context";
+          // TODO(addaleax): This should be ERR_WORKER_INIT_FAILED,
+          // ERR_WORKER_OUT_OF_MEMORY is for reaching the per-Worker heap limit.
+          Exit(1, "ERR_WORKER_OUT_OF_MEMORY", "Failed to create new Context");
           return;
         }
       }
@@ -306,11 +313,15 @@ void Worker::Run() {
             context,
             std::move(argv_),
             std::move(exec_argv_),
-            EnvironmentFlags::kNoFlags,
-            thread_id_));
+            static_cast<EnvironmentFlags::Flags>(environment_flags_),
+            thread_id_,
+            std::move(inspector_parent_handle_)));
         if (is_stopped()) return;
         CHECK_NOT_NULL(env_);
         env_->set_env_vars(std::move(env_vars_));
+        SetProcessExitHandler(env_.get(), [this](Environment*, int exit_code) {
+          Exit(exit_code);
+        });
       }
       {
         Mutex::ScopedLock lock(mutex_);
@@ -322,51 +333,19 @@ void Worker::Run() {
       {
         CreateEnvMessagePort(env_.get());
         Debug(this, "Created message port for worker %llu", thread_id_.id);
-        if (LoadEnvironment(env_.get(),
-                            StartExecutionCallback{},
-                            std::move(inspector_parent_handle_))
-                .IsEmpty()) {
+        if (LoadEnvironment(env_.get(), StartExecutionCallback{}).IsEmpty())
           return;
-        }
 
         Debug(this, "Loaded environment for worker %llu", thread_id_.id);
-      }
-
-      if (is_stopped()) return;
-      {
-        SealHandleScope seal(isolate_);
-        bool more;
-        env_->performance_state()->Mark(
-            node::performance::NODE_PERFORMANCE_MILESTONE_LOOP_START);
-        do {
-          if (is_stopped()) break;
-          uv_run(&data.loop_, UV_RUN_DEFAULT);
-          if (is_stopped()) break;
-
-          platform_->DrainTasks(isolate_);
-
-          more = uv_loop_alive(&data.loop_);
-          if (more && !is_stopped()) continue;
-
-          EmitBeforeExit(env_.get());
-
-          // Emit `beforeExit` if the loop became alive either after emitting
-          // event, or after running some callbacks.
-          more = uv_loop_alive(&data.loop_);
-        } while (more == true && !is_stopped());
-        env_->performance_state()->Mark(
-            node::performance::NODE_PERFORMANCE_MILESTONE_LOOP_EXIT);
       }
     }
 
     {
-      int exit_code;
-      bool stopped = is_stopped();
-      if (!stopped)
-        exit_code = EmitExit(env_.get());
+      Maybe<int> exit_code = SpinEventLoop(env_.get());
       Mutex::ScopedLock lock(mutex_);
-      if (exit_code_ == 0 && !stopped)
-        exit_code_ = exit_code;
+      if (exit_code_ == 0 && exit_code.IsJust()) {
+        exit_code_ = exit_code.FromJust();
+      }
 
       Debug(this, "Exiting thread for worker %llu with exit code %d",
             thread_id_.id, exit_code_);
@@ -420,9 +399,10 @@ void Worker::JoinThread() {
     MakeCallback(env()->onexit_string(), arraysize(args), args);
   }
 
-  // We cleared all libuv handles bound to this Worker above,
-  // the C++ object is no longer needed for anything now.
-  MakeWeak();
+  // If we get here, the !thread_joined_ condition at the top of the function
+  // implies that the thread was running. In that case, its final action will
+  // be to schedule a callback on the parent thread which will delete this
+  // object, so there's nothing more to do here.
 }
 
 Worker::~Worker() {
@@ -452,7 +432,6 @@ void Worker::New(const FunctionCallbackInfo<Value>& args) {
 
   std::vector<std::string> exec_argv_out;
 
-  CHECK_EQ(args.Length(), 4);
   // Argument might be a string or URL
   if (!args[0]->IsNullOrUndefined()) {
     Utf8Value value(
@@ -483,9 +462,9 @@ void Worker::New(const FunctionCallbackInfo<Value>& args) {
 #ifndef NODE_WITHOUT_NODE_OPTIONS
     MaybeLocal<String> maybe_node_opts =
         env_vars->Get(isolate, OneByteString(isolate, "NODE_OPTIONS"));
-    if (!maybe_node_opts.IsEmpty()) {
-      std::string node_options(
-          *String::Utf8Value(isolate, maybe_node_opts.ToLocalChecked()));
+    Local<String> node_opts;
+    if (maybe_node_opts.ToLocal(&node_opts)) {
+      std::string node_options(*String::Utf8Value(isolate, node_opts));
       std::vector<std::string> errors{};
       std::vector<std::string> env_argv =
           ParseNodeOptionsEnvVar(node_options, &errors);
@@ -498,7 +477,7 @@ void Worker::New(const FunctionCallbackInfo<Value>& args) {
                             per_isolate_opts.get(),
                             kAllowedInEnvironment,
                             &errors);
-      if (errors.size() > 0 && args[1]->IsObject()) {
+      if (!errors.empty() && args[1]->IsObject()) {
         // Only fail for explicitly provided env, this protects from failures
         // when NODE_OPTIONS from parent's env is used (which is the default).
         Local<Value> error;
@@ -525,14 +504,11 @@ void Worker::New(const FunctionCallbackInfo<Value>& args) {
       if (!array->Get(env->context(), i).ToLocal(&arg)) {
         return;
       }
-      MaybeLocal<String> arg_v8_string =
-          arg->ToString(env->context());
-      if (arg_v8_string.IsEmpty()) {
+      Local<String> arg_v8;
+      if (!arg->ToString(env->context()).ToLocal(&arg_v8)) {
         return;
       }
-      Utf8Value arg_utf8_value(
-          args.GetIsolate(),
-          arg_v8_string.FromMaybe(Local<String>()));
+      Utf8Value arg_utf8_value(args.GetIsolate(), arg_v8);
       std::string arg_string(arg_utf8_value.out(), arg_utf8_value.length());
       exec_argv.push_back(arg_string);
     }
@@ -581,6 +557,10 @@ void Worker::New(const FunctionCallbackInfo<Value>& args) {
   CHECK_EQ(limit_info->Length(), kTotalResourceLimitCount);
   limit_info->CopyContents(worker->resource_limits_,
                            sizeof(worker->resource_limits_));
+
+  CHECK(args[4]->IsBoolean());
+  if (args[4]->IsTrue() || env->tracks_unmanaged_fds())
+    worker->environment_flags_ |= EnvironmentFlags::kTrackUnmanagedFds;
 }
 
 void Worker::StartThread(const FunctionCallbackInfo<Value>& args) {
@@ -588,20 +568,22 @@ void Worker::StartThread(const FunctionCallbackInfo<Value>& args) {
   ASSIGN_OR_RETURN_UNWRAP(&w, args.This());
   Mutex::ScopedLock lock(w->mutex_);
 
-  // The object now owns the created thread and should not be garbage collected
-  // until that finishes.
-  w->ClearWeak();
-
-  w->env()->add_sub_worker_context(w);
   w->stopped_ = false;
-  w->thread_joined_ = false;
 
-  if (w->has_ref_)
-    w->env()->add_refs(1);
+  if (w->resource_limits_[kStackSizeMb] > 0) {
+    if (w->resource_limits_[kStackSizeMb] * kMB < kStackBufferSize) {
+      w->resource_limits_[kStackSizeMb] = kStackBufferSize / kMB;
+      w->stack_size_ = kStackBufferSize;
+    } else {
+      w->stack_size_ = w->resource_limits_[kStackSizeMb] * kMB;
+    }
+  } else {
+    w->resource_limits_[kStackSizeMb] = w->stack_size_ / kMB;
+  }
 
   uv_thread_options_t thread_options;
   thread_options.flags = UV_THREAD_HAS_STACK_SIZE;
-  thread_options.stack_size = kStackSize;
+  thread_options.stack_size = w->stack_size_;
   int ret = uv_thread_create_ex(&w->tid_, &thread_options, [](void* arg) {
     // XXX: This could become a std::unique_ptr, but that makes at least
     // gcc 6.3 detect undefined behaviour when there shouldn't be any.
@@ -611,7 +593,7 @@ void Worker::StartThread(const FunctionCallbackInfo<Value>& args) {
 
     // Leave a few kilobytes just to make sure we're within limits and have
     // some space to do work in C++ land.
-    w->stack_base_ = stack_top - (kStackSize - kStackBufferSize);
+    w->stack_base_ = stack_top - (w->stack_size_ - kStackBufferSize);
 
     w->Run();
 
@@ -624,21 +606,27 @@ void Worker::StartThread(const FunctionCallbackInfo<Value>& args) {
           // implicitly delete w
         });
   }, static_cast<void*>(w));
-  if (ret != 0) {
+
+  if (ret == 0) {
+    // The object now owns the created thread and should not be garbage
+    // collected until that finishes.
+    w->ClearWeak();
+    w->thread_joined_ = false;
+
+    if (w->has_ref_)
+      w->env()->add_refs(1);
+
+    w->env()->add_sub_worker_context(w);
+  } else {
+    w->stopped_ = true;
+
     char err_buf[128];
     uv_err_name_r(ret, err_buf, sizeof(err_buf));
-    w->custom_error_ = "ERR_WORKER_INIT_FAILED";
-    w->custom_error_str_ = err_buf;
-    w->loop_init_failed_ = true;
-    w->thread_joined_ = true;
-    w->stopped_ = true;
-    w->env()->remove_sub_worker_context(w);
     {
       Isolate* isolate = w->env()->isolate();
       HandleScope handle_scope(isolate);
       THROW_ERR_WORKER_INIT_FAILED(isolate, err_buf);
     }
-    w->MakeWeak();
   }
 }
 
@@ -653,7 +641,7 @@ void Worker::StopThread(const FunctionCallbackInfo<Value>& args) {
 void Worker::Ref(const FunctionCallbackInfo<Value>& args) {
   Worker* w;
   ASSIGN_OR_RETURN_UNWRAP(&w, args.This());
-  if (!w->has_ref_) {
+  if (!w->has_ref_ && !w->thread_joined_) {
     w->has_ref_ = true;
     w->env()->add_refs(1);
   }
@@ -662,7 +650,7 @@ void Worker::Ref(const FunctionCallbackInfo<Value>& args) {
 void Worker::Unref(const FunctionCallbackInfo<Value>& args) {
   Worker* w;
   ASSIGN_OR_RETURN_UNWRAP(&w, args.This());
-  if (w->has_ref_) {
+  if (w->has_ref_ && !w->thread_joined_) {
     w->has_ref_ = false;
     w->env()->add_refs(-1);
   }
@@ -683,9 +671,16 @@ Local<Float64Array> Worker::GetResourceLimits(Isolate* isolate) const {
   return Float64Array::New(ab, 0, kTotalResourceLimitCount);
 }
 
-void Worker::Exit(int code) {
+void Worker::Exit(int code, const char* error_code, const char* error_message) {
   Mutex::ScopedLock lock(mutex_);
-  Debug(this, "Worker %llu called Exit(%d)", thread_id_.id, code);
+  Debug(this, "Worker %llu called Exit(%d, %s, %s)",
+        thread_id_.id, code, error_code, error_message);
+
+  if (error_code != nullptr) {
+    custom_error_ = error_code;
+    custom_error_str_ = error_message;
+  }
+
   if (env_ != nullptr) {
     exit_code_ = code;
     Stop(env_);
@@ -696,6 +691,12 @@ void Worker::Exit(int code) {
 
 void Worker::MemoryInfo(MemoryTracker* tracker) const {
   tracker->TrackField("parent_port", parent_port_);
+}
+
+bool Worker::IsNotIndicativeOfMemoryLeakAtExit() const {
+  // Worker objects always stay alive as long as the child thread, regardless
+  // of whether they are being referenced in the parent thread.
+  return true;
 }
 
 class WorkerHeapSnapshotTaker : public AsyncWrap {
@@ -740,9 +741,42 @@ void Worker::TakeHeapSnapshot(const FunctionCallbackInfo<Value>& args) {
               env, std::move(snapshot));
           Local<Value> args[] = { stream->object() };
           taker->MakeCallback(env->ondone_string(), arraysize(args), args);
-        });
+        }, CallbackFlags::kUnrefed);
   });
   args.GetReturnValue().Set(scheduled ? taker->object() : Local<Object>());
+}
+
+void Worker::LoopIdleTime(const FunctionCallbackInfo<Value>& args) {
+  Worker* w;
+  ASSIGN_OR_RETURN_UNWRAP(&w, args.This());
+
+  Mutex::ScopedLock lock(w->mutex_);
+  // Using w->is_stopped() here leads to a deadlock, and checking is_stopped()
+  // before locking the mutex is a race condition. So manually do the same
+  // check.
+  if (w->stopped_ || w->env_ == nullptr)
+    return args.GetReturnValue().Set(-1);
+
+  uint64_t idle_time = uv_metrics_idle_time(w->env_->event_loop());
+  args.GetReturnValue().Set(1.0 * idle_time / 1e6);
+}
+
+void Worker::LoopStartTime(const FunctionCallbackInfo<Value>& args) {
+  Worker* w;
+  ASSIGN_OR_RETURN_UNWRAP(&w, args.This());
+
+  Mutex::ScopedLock lock(w->mutex_);
+  // Using w->is_stopped() here leads to a deadlock, and checking is_stopped()
+  // before locking the mutex is a race condition. So manually do the same
+  // check.
+  if (w->stopped_ || w->env_ == nullptr)
+    return args.GetReturnValue().Set(-1);
+
+  double loop_start_time = w->env_->performance_state()->milestones[
+      node::performance::NODE_PERFORMANCE_MILESTONE_LOOP_START];
+  CHECK_GE(loop_start_time, 0);
+  args.GetReturnValue().Set(
+      (loop_start_time - node::performance::timeOrigin) / 1e6);
 }
 
 namespace {
@@ -778,6 +812,8 @@ void InitWorker(Local<Object> target,
     env->SetProtoMethod(w, "unref", Worker::Unref);
     env->SetProtoMethod(w, "getResourceLimits", Worker::GetResourceLimits);
     env->SetProtoMethod(w, "takeHeapSnapshot", Worker::TakeHeapSnapshot);
+    env->SetProtoMethod(w, "loopIdleTime", Worker::LoopIdleTime);
+    env->SetProtoMethod(w, "loopStartTime", Worker::LoopStartTime);
 
     Local<String> workerString =
         FIXED_ONE_BYTE_STRING(env->isolate(), "Worker");
@@ -831,12 +867,26 @@ void InitWorker(Local<Object> target,
   NODE_DEFINE_CONSTANT(target, kMaxYoungGenerationSizeMb);
   NODE_DEFINE_CONSTANT(target, kMaxOldGenerationSizeMb);
   NODE_DEFINE_CONSTANT(target, kCodeRangeSizeMb);
+  NODE_DEFINE_CONSTANT(target, kStackSizeMb);
   NODE_DEFINE_CONSTANT(target, kTotalResourceLimitCount);
 }
 
-}  // anonymous namespace
+void RegisterExternalReferences(ExternalReferenceRegistry* registry) {
+  registry->Register(GetEnvMessagePort);
+  registry->Register(Worker::New);
+  registry->Register(Worker::StartThread);
+  registry->Register(Worker::StopThread);
+  registry->Register(Worker::Ref);
+  registry->Register(Worker::Unref);
+  registry->Register(Worker::GetResourceLimits);
+  registry->Register(Worker::TakeHeapSnapshot);
+  registry->Register(Worker::LoopIdleTime);
+  registry->Register(Worker::LoopStartTime);
+}
 
+}  // anonymous namespace
 }  // namespace worker
 }  // namespace node
 
 NODE_MODULE_CONTEXT_AWARE_INTERNAL(worker, node::worker::InitWorker)
+NODE_MODULE_EXTERNAL_REFERENCE(worker, node::worker::RegisterExternalReferences)

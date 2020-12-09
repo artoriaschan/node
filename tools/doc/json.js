@@ -24,7 +24,7 @@
 const unified = require('unified');
 const common = require('./common.js');
 const html = require('remark-html');
-const select = require('unist-util-select');
+const { selectAll } = require('unist-util-select');
 
 module.exports = { jsonAPI };
 
@@ -38,7 +38,7 @@ function jsonAPI({ filename }) {
     const stabilityExpr = /^Stability: ([0-5])(?:\s*-\s*)?(.*)$/s;
 
     // Extract definitions.
-    const definitions = select(tree, 'definition');
+    const definitions = selectAll('definition', tree);
 
     // Determine the start, stop, and depth of each section.
     const sections = [];
@@ -436,8 +436,8 @@ const r = String.raw;
 const eventPrefix = '^Event: +';
 const classPrefix = '^[Cc]lass: +';
 const ctorPrefix = '^(?:[Cc]onstructor: +)?`?new +';
-const classMethodPrefix = '^Class Method: +';
-const maybeClassPropertyPrefix = '(?:Class Property: +)?';
+const classMethodPrefix = '^Static method: +';
+const maybeClassPropertyPrefix = '(?:Class property: +)?';
 
 const maybeQuote = '[\'"]?';
 const notQuotes = '[^\'"]+';
@@ -455,8 +455,6 @@ const ancestors = r`(?:${id}\.?)+`;
 const maybeAncestors = r`(?:${id}\.?)*`;
 
 const callWithParams = r`\([^)]*\)`;
-
-const noCallOrProp = '(?![.[(])';
 
 const maybeExtends = `(?: +extends +${maybeAncestors}${classId})?`;
 
@@ -478,7 +476,7 @@ const headingExpressions = [
     `^${maybeBacktick}${maybeAncestors}(${id})${callWithParams}${maybeBacktick}$`, 'i') },
 
   { type: 'property', re: RegExp(
-    `^${maybeClassPropertyPrefix}${maybeBacktick}${ancestors}(${id})${maybeBacktick}${noCallOrProp}$`, 'i') },
+    `^${maybeClassPropertyPrefix}${maybeBacktick}${ancestors}(${id})${maybeBacktick}$`, 'i') },
 ];
 /* eslint-enable max-len */
 
@@ -508,8 +506,7 @@ function textJoin(nodes, file) {
       return `_${textJoin(node.children, file)}_`;
     } else if (node.children) {
       return textJoin(node.children, file);
-    } else {
-      return node.value;
     }
+    return node.value;
   }).join('');
 }

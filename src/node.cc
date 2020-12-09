@@ -41,6 +41,7 @@
 #include "node_version.h"
 
 #if HAVE_OPENSSL
+#include "allocated_buffer-inl.h"  // Inlined functions needed by node_crypto.h
 #include "node_crypto.h"
 #endif
 
@@ -68,15 +69,19 @@
 
 #include "large_pages/node_large_page.h"
 
-#if defined(__APPLE__) || defined(__linux__)
+#if defined(__APPLE__) || defined(__linux__) || defined(_WIN32)
 #define NODE_USE_V8_WASM_TRAP_HANDLER 1
 #else
 #define NODE_USE_V8_WASM_TRAP_HANDLER 0
 #endif
 
 #if NODE_USE_V8_WASM_TRAP_HANDLER
+#if defined(_WIN32)
+#include "v8-wasm-trap-handler-win.h"
+#else
 #include <atomic>
 #include "v8-wasm-trap-handler-posix.h"
+#endif
 #endif  // NODE_USE_V8_WASM_TRAP_HANDLER
 
 // ========== global C headers ==========
@@ -124,10 +129,8 @@ using native_module::NativeModuleEnv;
 using v8::EscapableHandleScope;
 using v8::Function;
 using v8::FunctionCallbackInfo;
-using v8::HandleScope;
 using v8::Isolate;
 using v8::Local;
-using v8::Maybe;
 using v8::MaybeLocal;
 using v8::Object;
 using v8::String;
@@ -149,8 +152,10 @@ bool v8_initialized = false;
 // node_internals.h
 // process-relative uptime base in nanoseconds, initialized in node::Start()
 uint64_t node_start_time;
-// Tells whether --prof is passed.
-bool v8_is_profiling = false;
+
+#if NODE_USE_V8_WASM_TRAP_HANDLER && defined(_WIN32)
+PVOID old_vectored_exception_handler;
+#endif
 
 // node_v8_platform-inl.h
 struct V8Platform v8_platform;
@@ -171,11 +176,11 @@ MaybeLocal<Value> ExecuteBootstrapper(Environment* env,
   MaybeLocal<Function> maybe_fn =
       NativeModuleEnv::LookupAndCompile(env->context(), id, parameters, env);
 
-  if (maybe_fn.IsEmpty()) {
+  Local<Function> fn;
+  if (!maybe_fn.ToLocal(&fn)) {
     return MaybeLocal<Value>();
   }
 
-  Local<Function> fn = maybe_fn.ToLocalChecked();
   MaybeLocal<Value> result = fn->Call(env->context(),
                                       Undefined(env->isolate()),
                                       arguments->size(),
@@ -229,11 +234,60 @@ int Environment::InitializeInspector(
 }
 #endif  // HAVE_INSPECTOR && NODE_USE_V8_PLATFORM
 
+#define ATOMIC_WAIT_EVENTS(V)                                               \
+  V(kStartWait,           "started")                                        \
+  V(kWokenUp,             "was woken up by another thread")                 \
+  V(kTimedOut,            "timed out")                                      \
+  V(kTerminatedExecution, "was stopped by terminated execution")            \
+  V(kAPIStopped,          "was stopped through the embedder API")           \
+  V(kNotEqual,            "did not wait because the values mismatched")     \
+
+static void AtomicsWaitCallback(Isolate::AtomicsWaitEvent event,
+                                Local<v8::SharedArrayBuffer> array_buffer,
+                                size_t offset_in_bytes, int64_t value,
+                                double timeout_in_ms,
+                                Isolate::AtomicsWaitWakeHandle* stop_handle,
+                                void* data) {
+  Environment* env = static_cast<Environment*>(data);
+
+  const char* message = "(unknown event)";
+  switch (event) {
+#define V(key, msg)                         \
+    case Isolate::AtomicsWaitEvent::key:    \
+      message = msg;                        \
+      break;
+    ATOMIC_WAIT_EVENTS(V)
+#undef V
+  }
+
+  fprintf(stderr,
+          "(node:%d) [Thread %" PRIu64 "] Atomics.wait(%p + %zx, %" PRId64
+              ", %.f) %s\n",
+          static_cast<int>(uv_os_getpid()),
+          env->thread_id(),
+          array_buffer->GetBackingStore()->Data(),
+          offset_in_bytes,
+          value,
+          timeout_in_ms,
+          message);
+}
+
 void Environment::InitializeDiagnostics() {
   isolate_->GetHeapProfiler()->AddBuildEmbedderGraphCallback(
       Environment::BuildEmbedderGraph, this);
+  if (options_->heap_snapshot_near_heap_limit > 0) {
+    isolate_->AddNearHeapLimitCallback(Environment::NearHeapLimitCallback,
+                                       this);
+  }
   if (options_->trace_uncaught)
     isolate_->SetCaptureStackTraceForUncaughtExceptions(true);
+  if (options_->trace_atomics_wait) {
+    isolate_->SetAtomicsWaitCallback(AtomicsWaitCallback, this);
+    AddCleanupHook([](void* data) {
+      Environment* env = static_cast<Environment*>(data);
+      env->isolate()->SetAtomicsWaitCallback(nullptr, nullptr);
+    }, this);
+  }
 
 #if defined HAVE_DTRACE || defined HAVE_ETW
   InitDTrace(this);
@@ -308,6 +362,7 @@ MaybeLocal<Value> Environment::BootstrapNode() {
     return scope.EscapeMaybe(result);
   }
 
+  // TODO(joyeecheung): skip these in the snapshot building for workers.
   auto thread_switch_id =
       is_main_thread() ? "internal/bootstrap/switches/is_main_thread"
                        : "internal/bootstrap/switches/is_not_main_thread";
@@ -331,8 +386,7 @@ MaybeLocal<Value> Environment::BootstrapNode() {
 
   Local<String> env_string = FIXED_ONE_BYTE_STRING(isolate_, "env");
   Local<Object> env_var_proxy;
-  if (!CreateEnvVarProxy(context(), isolate_, as_callback_data())
-           .ToLocal(&env_var_proxy) ||
+  if (!CreateEnvVarProxy(context(), isolate_).ToLocal(&env_var_proxy) ||
       process_object()->Set(context(), env_string, env_var_proxy).IsNothing()) {
     return MaybeLocal<Value>();
   }
@@ -418,13 +472,6 @@ MaybeLocal<Value> StartExecution(Environment* env, StartExecutionCallback cb) {
     return scope.EscapeMaybe(cb(info));
   }
 
-  // To allow people to extend Node in different ways, this hook allows
-  // one to drop a file lib/_third_party_main.js into the build
-  // directory which will be executed instead of Node's normal loading.
-  if (NativeModuleEnv::Exists("_third_party_main")) {
-    return StartExecution(env, "internal/main/run_third_party_main");
-  }
-
   if (env->worker_context() != nullptr) {
     return StartExecution(env, "internal/main/worker_thread");
   }
@@ -434,7 +481,7 @@ MaybeLocal<Value> StartExecution(Environment* env, StartExecutionCallback cb) {
     first_argv = env->argv()[1];
   }
 
-  if (first_argv == "inspect" || first_argv == "debug") {
+  if (first_argv == "inspect") {
     return StartExecution(env, "internal/main/inspect");
   }
 
@@ -471,6 +518,14 @@ MaybeLocal<Value> StartExecution(Environment* env, StartExecutionCallback cb) {
 typedef void (*sigaction_cb)(int signo, siginfo_t* info, void* ucontext);
 #endif
 #if NODE_USE_V8_WASM_TRAP_HANDLER
+#if defined(_WIN32)
+static LONG TrapWebAssemblyOrContinue(EXCEPTION_POINTERS* exception) {
+  if (v8::TryHandleWebAssemblyTrapWindows(exception)) {
+    return EXCEPTION_CONTINUE_EXECUTION;
+  }
+  return EXCEPTION_CONTINUE_SEARCH;
+}
+#else
 static std::atomic<sigaction_cb> previous_sigsegv_action;
 
 void TrapWebAssemblyOrContinue(int signo, siginfo_t* info, void* ucontext) {
@@ -490,6 +545,7 @@ void TrapWebAssemblyOrContinue(int signo, siginfo_t* info, void* ucontext) {
     }
   }
 }
+#endif  // defined(_WIN32)
 #endif  // NODE_USE_V8_WASM_TRAP_HANDLER
 
 #ifdef __POSIX__
@@ -512,7 +568,6 @@ void RegisterSignalHandler(int signal,
   sigfillset(&sa.sa_mask);
   CHECK_EQ(sigaction(signal, &sa, nullptr), 0);
 }
-
 #endif  // __POSIX__
 
 #ifdef __POSIX__
@@ -595,6 +650,13 @@ inline void PlatformInit() {
   RegisterSignalHandler(SIGTERM, SignalExit, true);
 
 #if NODE_USE_V8_WASM_TRAP_HANDLER
+#if defined(_WIN32)
+  {
+    constexpr ULONG first = TRUE;
+    per_process::old_vectored_exception_handler =
+        AddVectoredExceptionHandler(first, TrapWebAssemblyOrContinue);
+  }
+#else
   // Tell V8 to disable emitting WebAssembly
   // memory bounds checks. This means that we have
   // to catch the SIGSEGV in TrapWebAssemblyOrContinue
@@ -603,8 +665,10 @@ inline void PlatformInit() {
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_sigaction = TrapWebAssemblyOrContinue;
+    sa.sa_flags = SA_SIGINFO;
     CHECK_EQ(sigaction(SIGSEGV, &sa, nullptr), 0);
   }
+#endif  // defined(_WIN32)
   V8::EnableWebAssemblyTrapHandler(false);
 #endif  // NODE_USE_V8_WASM_TRAP_HANDLER
 
@@ -694,7 +758,10 @@ void ResetStdio() {
         err = tcsetattr(fd, TCSANOW, &s.termios);
       while (err == -1 && errno == EINTR);  // NOLINT
       CHECK_EQ(0, pthread_sigmask(SIG_UNBLOCK, &sa, nullptr));
-      CHECK_EQ(0, err);
+
+      // Normally we expect err == 0. But if macOS App Sandbox is enabled,
+      // tcsetattr will fail with err == -1 and errno == EPERM.
+      CHECK_IMPLIES(err != 0, err == -1 && errno == EPERM);
     }
   }
 #endif  // __POSIX__
@@ -735,6 +802,13 @@ int ProcessGlobalArgs(std::vector<std::string>* args,
     return 12;
   }
 
+  // TODO(mylesborins): remove this when the harmony-top-level-await flag
+  // is removed in V8
+  if (std::find(v8_args.begin(), v8_args.end(),
+                "--no-harmony-top-level-await") == v8_args.end()) {
+    v8_args.push_back("--harmony-top-level-await");
+  }
+
   auto env_opts = per_process::cli_options->per_isolate->per_env;
   if (std::find(v8_args.begin(), v8_args.end(),
                 "--abort-on-uncaught-exception") != v8_args.end() ||
@@ -743,19 +817,11 @@ int ProcessGlobalArgs(std::vector<std::string>* args,
     env_opts->abort_on_uncaught_exception = true;
   }
 
-  // TODO(bnoordhuis) Intercept --prof arguments and start the CPU profiler
-  // manually?  That would give us a little more control over its runtime
-  // behavior but it could also interfere with the user's intentions in ways
-  // we fail to anticipate.  Dillema.
-  if (std::find(v8_args.begin(), v8_args.end(), "--prof") != v8_args.end()) {
-    per_process::v8_is_profiling = true;
-  }
-
 #ifdef __POSIX__
   // Block SIGPROF signals when sleeping in epoll_wait/kevent/etc.  Avoids the
   // performance penalty of frequent EINTR wakeups when the profiler is running.
   // Only do this for v8.log profiling, as it breaks v8::CpuProfiler users.
-  if (per_process::v8_is_profiling) {
+  if (std::find(v8_args.begin(), v8_args.end(), "--prof") != v8_args.end()) {
     uv_loop_configure(uv_default_loop(), UV_LOOP_BLOCK_SIGNAL, SIGPROF);
   }
 #endif
@@ -881,52 +947,6 @@ int InitializeNodeWithArgs(std::vector<std::string>* argv,
   return 0;
 }
 
-// TODO(addaleax): Deprecate and eventually remove this.
-void Init(int* argc,
-          const char** argv,
-          int* exec_argc,
-          const char*** exec_argv) {
-  std::vector<std::string> argv_(argv, argv + *argc);  // NOLINT
-  std::vector<std::string> exec_argv_;
-  std::vector<std::string> errors;
-
-  // This (approximately) duplicates some logic that has been moved to
-  // node::Start(), with the difference that here we explicitly call `exit()`.
-  int exit_code = InitializeNodeWithArgs(&argv_, &exec_argv_, &errors);
-
-  for (const std::string& error : errors)
-    fprintf(stderr, "%s: %s\n", argv_.at(0).c_str(), error.c_str());
-  if (exit_code != 0) exit(exit_code);
-
-  if (per_process::cli_options->print_version) {
-    printf("%s\n", NODE_VERSION);
-    exit(0);
-  }
-
-  if (per_process::cli_options->print_bash_completion) {
-    std::string completion = options_parser::GetBashCompletion();
-    printf("%s\n", completion.c_str());
-    exit(0);
-  }
-
-  if (per_process::cli_options->print_v8_help) {
-    // Doesn't return.
-    V8::SetFlagsFromString("--help", static_cast<size_t>(6));
-    UNREACHABLE();
-  }
-
-  *argc = argv_.size();
-  *exec_argc = exec_argv_.size();
-  // These leak memory, because, in the original code of this function, no
-  // extra allocations were visible. This should be okay because this function
-  // is only supposed to be called once per process, though.
-  *exec_argv = Malloc<const char*>(*exec_argc);
-  for (int i = 0; i < *exec_argc; ++i)
-    (*exec_argv)[i] = strdup(exec_argv_[i].c_str());
-  for (int i = 0; i < *argc; ++i)
-    argv[i] = strdup(argv_[i].c_str());
-}
-
 InitializationResult InitializeOncePerProcess(int argc, char** argv) {
   // Initialized the enabled list for Debug() calls with system
   // environment variables.
@@ -974,13 +994,16 @@ InitializationResult InitializeOncePerProcess(int argc, char** argv) {
   if (per_process::cli_options->print_bash_completion) {
     std::string completion = options_parser::GetBashCompletion();
     printf("%s\n", completion.c_str());
-    exit(0);
+    result.exit_code = 0;
+    result.early_return = true;
+    return result;
   }
 
   if (per_process::cli_options->print_v8_help) {
-    // Doesn't return.
     V8::SetFlagsFromString("--help", static_cast<size_t>(6));
-    UNREACHABLE();
+    result.exit_code = 0;
+    result.early_return = true;
+    return result;
   }
 
 #if HAVE_OPENSSL
@@ -1011,6 +1034,10 @@ void TearDownOncePerProcess() {
   per_process::v8_initialized = false;
   V8::Dispose();
 
+#if NODE_USE_V8_WASM_TRAP_HANDLER && defined(_WIN32)
+  RemoveVectoredExceptionHandler(per_process::old_vectored_exception_handler);
+#endif
+
   // uv_run cannot be called from the time before the beforeExit callback
   // runs until the program exits unless the event loop has any referenced
   // handles after beforeExit terminates. This prevents unrefed timers
@@ -1029,21 +1056,18 @@ int Start(int argc, char** argv) {
   {
     Isolate::CreateParams params;
     const std::vector<size_t>* indexes = nullptr;
-    std::vector<intptr_t> external_references;
-
+    const EnvSerializeInfo* env_info = nullptr;
     bool force_no_snapshot =
         per_process::cli_options->per_isolate->no_node_snapshot;
     if (!force_no_snapshot) {
       v8::StartupData* blob = NodeMainInstance::GetEmbeddedSnapshotBlob();
       if (blob != nullptr) {
-        // TODO(joyeecheung): collect external references and set it in
-        // params.external_references.
-        external_references.push_back(reinterpret_cast<intptr_t>(nullptr));
-        params.external_references = external_references.data();
         params.snapshot_blob = blob;
         indexes = NodeMainInstance::GetIsolateDataIndexes();
+        env_info = NodeMainInstance::GetEnvSerializeInfo();
       }
     }
+    uv_loop_configure(uv_default_loop(), UV_METRICS_IDLE_TIME);
 
     NodeMainInstance main_instance(&params,
                                    uv_default_loop(),
@@ -1051,7 +1075,7 @@ int Start(int argc, char** argv) {
                                    result.args,
                                    result.exec_args,
                                    indexes);
-    result.exit_code = main_instance.Run();
+    result.exit_code = main_instance.Run(env_info);
   }
 
   TearDownOncePerProcess();

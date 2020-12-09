@@ -32,6 +32,73 @@ class EnvironmentTest : public EnvironmentTestFixture {
   }
 };
 
+TEST_F(EnvironmentTest, EnvironmentWithESMLoader) {
+  const v8::HandleScope handle_scope(isolate_);
+  Argv argv;
+  Env env {handle_scope, argv};
+
+  node::Environment* envi = *env;
+  envi->options()->experimental_vm_modules = true;
+
+  SetProcessExitHandler(*env, [&](node::Environment* env_, int exit_code) {
+    EXPECT_EQ(*env, env_);
+    EXPECT_EQ(exit_code, 0);
+    node::Stop(*env);
+  });
+
+  node::LoadEnvironment(
+      *env,
+      "const { SourceTextModule } = require('vm');"
+      "(async () => {"
+        "const stmString = 'globalThis.importResult = import(\"\")';"
+        "const m = new SourceTextModule(stmString, {"
+          "importModuleDynamically: (async () => {"
+            "const m = new SourceTextModule('');"
+            "await m.link(() => 0);"
+            "await m.evaluate();"
+            "return m.namespace;"
+          "}),"
+        "});"
+        "await m.link(() => 0);"
+        "await m.evaluate();"
+        "delete globalThis.importResult;"
+        "process.exit(0);"
+      "})()");
+}
+
+TEST_F(EnvironmentTest, EnvironmentWithNoESMLoader) {
+  const v8::HandleScope handle_scope(isolate_);
+  Argv argv;
+  Env env {handle_scope, argv, node::EnvironmentFlags::kNoRegisterESMLoader};
+
+  node::Environment* envi = *env;
+  envi->options()->experimental_vm_modules = true;
+
+  SetProcessExitHandler(*env, [&](node::Environment* env_, int exit_code) {
+    EXPECT_EQ(*env, env_);
+    EXPECT_EQ(exit_code, 1);
+    node::Stop(*env);
+  });
+
+  node::LoadEnvironment(
+      *env,
+      "const { SourceTextModule } = require('vm');"
+      "(async () => {"
+        "const stmString = 'globalThis.importResult = import(\"\")';"
+        "const m = new SourceTextModule(stmString, {"
+          "importModuleDynamically: (async () => {"
+            "const m = new SourceTextModule('');"
+            "await m.link(() => 0);"
+            "await m.evaluate();"
+            "return m.namespace;"
+          "}),"
+        "});"
+        "await m.link(() => 0);"
+        "await m.evaluate();"
+        "delete globalThis.importResult;"
+      "})()");
+}
+
 TEST_F(EnvironmentTest, PreExecutionPreparation) {
   const v8::HandleScope handle_scope(isolate_);
   const Argv argv;
@@ -47,8 +114,8 @@ TEST_F(EnvironmentTest, PreExecutionPreparation) {
   v8::Local<v8::Script> script = v8::Script::Compile(
       context,
       v8::String::NewFromOneByte(isolate_,
-                                 reinterpret_cast<const uint8_t*>(run_script),
-                                 v8::NewStringType::kNormal).ToLocalChecked())
+                                 reinterpret_cast<const uint8_t*>(run_script))
+                                 .ToLocalChecked())
       .ToLocalChecked();
   v8::Local<v8::Value> result = script->Run(context).ToLocalChecked();
   CHECK(result->IsString());
@@ -73,8 +140,8 @@ TEST_F(EnvironmentTest, LoadEnvironmentWithCallback) {
         context,
         v8::String::NewFromOneByte(
             isolate_,
-            reinterpret_cast<const uint8_t*>("argv0"),
-            v8::NewStringType::kNormal).ToLocalChecked()).ToLocalChecked();
+            reinterpret_cast<const uint8_t*>("argv0"))
+            .ToLocalChecked()).ToLocalChecked();
     CHECK(argv0->IsString());
 
     return info.process_object;
@@ -98,15 +165,15 @@ TEST_F(EnvironmentTest, LoadEnvironmentWithSource) {
       context,
       v8::String::NewFromOneByte(
           isolate_,
-          reinterpret_cast<const uint8_t*>("process"),
-          v8::NewStringType::kNormal).ToLocalChecked())
+          reinterpret_cast<const uint8_t*>("process"))
+          .ToLocalChecked())
           .ToLocalChecked()->IsObject());
   CHECK(main_ret.As<v8::Object>()->Get(
       context,
       v8::String::NewFromOneByte(
           isolate_,
-          reinterpret_cast<const uint8_t*>("require"),
-          v8::NewStringType::kNormal).ToLocalChecked())
+          reinterpret_cast<const uint8_t*>("require"))
+          .ToLocalChecked())
           .ToLocalChecked()->IsFunction());
 }
 
@@ -115,17 +182,7 @@ TEST_F(EnvironmentTest, AtExitWithEnvironment) {
   const Argv argv;
   Env env {handle_scope, argv};
 
-  AtExit(*env, at_exit_callback1);
-  RunAtExit(*env);
-  EXPECT_TRUE(called_cb_1);
-}
-
-TEST_F(EnvironmentTest, AtExitWithoutEnvironment) {
-  const v8::HandleScope handle_scope(isolate_);
-  const Argv argv;
-  Env env {handle_scope, argv};
-
-  AtExit(at_exit_callback1);  // No Environment is passed to AtExit.
+  AtExit(*env, at_exit_callback1, nullptr);
   RunAtExit(*env);
   EXPECT_TRUE(called_cb_1);
 }
@@ -136,8 +193,8 @@ TEST_F(EnvironmentTest, AtExitOrder) {
   Env env {handle_scope, argv};
 
   // Test that callbacks are run in reverse order.
-  AtExit(*env, at_exit_callback_ordered1);
-  AtExit(*env, at_exit_callback_ordered2);
+  AtExit(*env, at_exit_callback_ordered1, nullptr);
+  AtExit(*env, at_exit_callback_ordered2, nullptr);
   RunAtExit(*env);
   EXPECT_TRUE(called_cb_ordered_1);
   EXPECT_TRUE(called_cb_ordered_2);
@@ -168,11 +225,12 @@ TEST_F(EnvironmentTest, AtExitRunsJS) {
 TEST_F(EnvironmentTest, MultipleEnvironmentsPerIsolate) {
   const v8::HandleScope handle_scope(isolate_);
   const Argv argv;
+  // Only one of the Environments can have default flags and own the inspector.
   Env env1 {handle_scope, argv};
-  Env env2 {handle_scope, argv};
+  Env env2 {handle_scope, argv, node::EnvironmentFlags::kNoFlags};
 
-  AtExit(*env1, at_exit_callback1);
-  AtExit(*env2, at_exit_callback2);
+  AtExit(*env1, at_exit_callback1, nullptr);
+  AtExit(*env2, at_exit_callback2, nullptr);
   RunAtExit(*env1);
   EXPECT_TRUE(called_cb_1);
   EXPECT_FALSE(called_cb_2);
@@ -265,11 +323,11 @@ TEST_F(EnvironmentTest, SetImmediateCleanup) {
     (*env)->SetImmediate([&](node::Environment* env_arg) {
       EXPECT_EQ(env_arg, *env);
       called++;
-    });
-    (*env)->SetUnrefImmediate([&](node::Environment* env_arg) {
+    }, node::CallbackFlags::kRefed);
+    (*env)->SetImmediate([&](node::Environment* env_arg) {
       EXPECT_EQ(env_arg, *env);
       called_unref++;
-    });
+    }, node::CallbackFlags::kUnrefed);
   }
 
   EXPECT_EQ(called, 1);
@@ -334,7 +392,7 @@ TEST_F(EnvironmentTest, InspectorMultipleEmbeddedEnvironments) {
       "        id: 1,\n"
       "        method: 'Runtime.evaluate',\n"
       "        params: {\n"
-      "          expression: 'global.variableFromParent = 42;'\n"
+      "          expression: 'globalThis.variableFromParent = 42;'\n"
       "        }\n"
       "      })\n"
       "    });\n"
@@ -401,13 +459,14 @@ TEST_F(EnvironmentTest, InspectorMultipleEmbeddedEnvironments) {
           { "dummy" },
           {},
           node::EnvironmentFlags::kNoFlags,
-          data->thread_id);
+          data->thread_id,
+          std::move(data->inspector_parent_handle));
       CHECK_NOT_NULL(environment);
 
       v8::Local<v8::Value> extracted_value = LoadEnvironment(
           environment,
-          "return global.variableFromParent;",
-          std::move(data->inspector_parent_handle)).ToLocalChecked();
+          "while (!global.variableFromParent) {}\n"
+          "return global.variableFromParent;").ToLocalChecked();
 
       uv_run(&loop, UV_RUN_DEFAULT);
       CHECK(extracted_value->IsInt32());
@@ -440,10 +499,112 @@ TEST_F(EnvironmentTest, InspectorMultipleEmbeddedEnvironments) {
           context,
           v8::String::NewFromOneByte(
               isolate_,
-              reinterpret_cast<const uint8_t*>("messageFromWorker"),
-              v8::NewStringType::kNormal).ToLocalChecked())
+              reinterpret_cast<const uint8_t*>("messageFromWorker"))
+              .ToLocalChecked())
               .ToLocalChecked();
   CHECK_EQ(data.extracted_value, 42);
   CHECK_EQ(from_inspector->IntegerValue(context).FromJust(), 42);
 }
 #endif  // HAVE_INSPECTOR
+
+TEST_F(EnvironmentTest, ExitHandlerTest) {
+  const v8::HandleScope handle_scope(isolate_);
+  const Argv argv;
+
+  int callback_calls = 0;
+
+  Env env {handle_scope, argv};
+  SetProcessExitHandler(*env, [&](node::Environment* env_, int exit_code) {
+    EXPECT_EQ(*env, env_);
+    EXPECT_EQ(exit_code, 42);
+    callback_calls++;
+    node::Stop(*env);
+  });
+  node::LoadEnvironment(*env, "process.exit(42)").ToLocalChecked();
+  EXPECT_EQ(callback_calls, 1);
+}
+
+TEST_F(EnvironmentTest, SetImmediateMicrotasks) {
+  int called = 0;
+
+  {
+    const v8::HandleScope handle_scope(isolate_);
+    const Argv argv;
+    Env env {handle_scope, argv};
+
+    node::LoadEnvironment(*env,
+                          [&](const node::StartExecutionCallbackInfo& info)
+                              -> v8::MaybeLocal<v8::Value> {
+      return v8::Object::New(isolate_);
+    });
+
+    (*env)->SetImmediate([&](node::Environment* env_arg) {
+      EXPECT_EQ(env_arg, *env);
+      isolate_->EnqueueMicrotask([](void* arg) {
+        ++*static_cast<int*>(arg);
+      }, &called);
+    }, node::CallbackFlags::kRefed);
+    uv_run(&current_loop, UV_RUN_DEFAULT);
+  }
+
+  EXPECT_EQ(called, 1);
+}
+
+#ifndef _WIN32  // No SIGINT on Windows.
+TEST_F(NodeZeroIsolateTestFixture, CtrlCWithOnlySafeTerminationTest) {
+  // We need to go through the whole setup dance here because we want to
+  // set only_terminate_in_safe_scope.
+  // Allocate and initialize Isolate.
+  v8::Isolate::CreateParams create_params;
+  create_params.array_buffer_allocator = allocator.get();
+  create_params.only_terminate_in_safe_scope = true;
+  v8::Isolate* isolate = v8::Isolate::Allocate();
+  CHECK_NOT_NULL(isolate);
+  platform->RegisterIsolate(isolate, &current_loop);
+  v8::Isolate::Initialize(isolate, create_params);
+
+  // Try creating Context + IsolateData + Environment.
+  {
+    v8::Isolate::Scope isolate_scope(isolate);
+    v8::HandleScope handle_scope(isolate);
+
+    auto context = node::NewContext(isolate);
+    CHECK(!context.IsEmpty());
+    v8::Context::Scope context_scope(context);
+
+    std::unique_ptr<node::IsolateData, decltype(&node::FreeIsolateData)>
+      isolate_data{node::CreateIsolateData(isolate,
+                                           &current_loop,
+                                           platform.get()),
+                   node::FreeIsolateData};
+    CHECK(isolate_data);
+
+    std::unique_ptr<node::Environment, decltype(&node::FreeEnvironment)>
+      environment{node::CreateEnvironment(isolate_data.get(),
+                                          context,
+                                          {},
+                                          {}),
+                  node::FreeEnvironment};
+    CHECK(environment);
+
+    v8::Local<v8::Value> main_ret =
+        node::LoadEnvironment(environment.get(),
+            "'use strict';\n"
+            "const { runInThisContext } = require('vm');\n"
+            "try {\n"
+            "  runInThisContext("
+            "    `process.kill(process.pid, 'SIGINT'); while(true){}`, "
+            "    { breakOnSigint: true });\n"
+            "  return 'unreachable';\n"
+            "} catch (err) {\n"
+            "  return err.code;\n"
+            "}").ToLocalChecked();
+    node::Utf8Value main_ret_str(isolate, main_ret);
+    EXPECT_EQ(std::string(*main_ret_str), "ERR_SCRIPT_EXECUTION_INTERRUPTED");
+  }
+
+  // Cleanup.
+  platform->UnregisterIsolate(isolate);
+  isolate->Dispose();
+}
+#endif  // _WIN32

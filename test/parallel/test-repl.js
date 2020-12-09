@@ -372,8 +372,8 @@ const errorTests = [
   {
     send: 'npm install foobar',
     expect: [
-      'npm should be run outside of the node repl, in your normal shell.',
-      '(Press Control-D to exit.)'
+      'npm should be run outside of the Node.js REPL, in your normal shell.',
+      '(Press Ctrl+D to exit.)'
     ]
   },
   {
@@ -453,7 +453,7 @@ const errorTests = [
       /\.load/,
       /\.save/,
       '',
-      'Press ^C to abort current expression, ^D to exit the repl',
+      'Press Ctrl+C to abort current expression, Ctrl+D to exit the REPL',
       /'thefourtheye'/
     ]
   },
@@ -560,7 +560,7 @@ const errorTests = [
     expect: '... ... ... undefined'
   },
   // REPL should get a normal require() function, not one that allows
-  // access to internal modules without the --expose_internals flag.
+  // access to internal modules without the --expose-internals flag.
   {
     send: 'require("internal/repl")',
     expect: [
@@ -754,6 +754,39 @@ const errorTests = [
       /^Uncaught SyntaxError: /
     ]
   },
+  {
+    send: 'console',
+    expect: [
+      'Object [console] {',
+      '  log: [Function: log],',
+      '  warn: [Function: warn],',
+      '  dir: [Function: dir],',
+      '  time: [Function: time],',
+      '  timeEnd: [Function: timeEnd],',
+      '  timeLog: [Function: timeLog],',
+      '  trace: [Function: trace],',
+      '  assert: [Function: assert],',
+      '  clear: [Function: clear],',
+      '  count: [Function: count],',
+      '  countReset: [Function: countReset],',
+      '  group: [Function: group],',
+      '  groupEnd: [Function: groupEnd],',
+      '  table: [Function: table],',
+      /  debug: \[Function: (debug|log)],/,
+      /  info: \[Function: (info|log)],/,
+      /  dirxml: \[Function: (dirxml|log)],/,
+      /  error: \[Function: (error|warn)],/,
+      /  groupCollapsed: \[Function: (groupCollapsed|group)],/,
+      /  Console: \[Function: Console],?/,
+      ...process.features.inspector ? [
+        '  profile: [Function: profile],',
+        '  profileEnd: [Function: profileEnd],',
+        '  timeStamp: [Function: timeStamp],',
+        '  context: [Function: context]',
+      ] : [],
+      '}',
+    ]
+  },
 ];
 
 const tcpTests = [
@@ -772,6 +805,16 @@ const tcpTests = [
   {
     send: `require(${JSON.stringify(moduleFilename)}).number`,
     expect: '42'
+  },
+  {
+    send: 'import comeOn from \'fhqwhgads\'',
+    expect: [
+      kSource,
+      kArrow,
+      '',
+      'Uncaught:',
+      /^SyntaxError: .* dynamic import/
+    ]
   }
 ];
 
@@ -794,7 +837,7 @@ const tcpTests = [
     socket.end();
   }
   common.allowGlobals(...Object.values(global));
-})();
+})().then(common.mustCall());
 
 function startTCPRepl() {
   let resolveSocket, resolveReplServer;
@@ -883,7 +926,7 @@ function event(ee, expected) {
       const data = inspect(expected, { compact: false });
       const msg = `The REPL did not reply as expected for:\n\n${data}`;
       reject(new Error(msg));
-    }, common.platformTimeout(1000));
+    }, common.platformTimeout(9999));
     ee.once('data', common.mustCall((...args) => {
       clearTimeout(timeout);
       resolve(...args);

@@ -86,7 +86,7 @@ async function checkModuleState() {
 
   assert.throws(() => {
     const m = new SourceTextModule('');
-    m.error;
+    m.error; // eslint-disable-line no-unused-expressions
   }, {
     code: 'ERR_VM_MODULE_STATUS',
     message: 'Module status must be errored'
@@ -95,7 +95,7 @@ async function checkModuleState() {
   await assert.rejects(async () => {
     const m = await createEmptyLinkedModule();
     await m.evaluate();
-    m.error;
+    m.error; // eslint-disable-line no-unused-expressions
   }, {
     code: 'ERR_VM_MODULE_STATUS',
     message: 'Module status must be errored'
@@ -103,7 +103,7 @@ async function checkModuleState() {
 
   assert.throws(() => {
     const m = new SourceTextModule('');
-    m.namespace;
+    m.namespace; // eslint-disable-line no-unused-expressions
   }, {
     code: 'ERR_VM_MODULE_STATUS',
     message: 'Module status must not be unlinked or linking'
@@ -182,13 +182,11 @@ async function checkExecution() {
   await (async () => {
     const m = new SourceTextModule('throw new Error();');
     await m.link(common.mustNotCall());
-    const evaluatePromise = m.evaluate();
-    await evaluatePromise.catch(() => {});
-    assert.strictEqual(m.status, 'errored');
     try {
-      await evaluatePromise;
+      await m.evaluate();
     } catch (err) {
       assert.strictEqual(m.error, err);
+      assert.strictEqual(m.status, 'errored');
       return;
     }
     assert.fail('Missing expected exception');
@@ -209,6 +207,22 @@ async function checkInvalidOptionForEvaluate() {
   });
 }
 
+function checkInvalidCachedData() {
+  [true, false, 'foo', {}, Array, function() {}].forEach((invalidArg) => {
+    const message = 'The "options.cachedData" property must be an ' +
+                    'instance of Buffer, TypedArray, or DataView.' +
+                    common.invalidArgTypeHelper(invalidArg);
+    assert.throws(
+      () => new SourceTextModule('import "foo";', { cachedData: invalidArg }),
+      {
+        code: 'ERR_INVALID_ARG_TYPE',
+        name: 'TypeError',
+        message,
+      }
+    );
+  });
+}
+
 const finished = common.mustCall();
 
 (async function main() {
@@ -217,5 +231,6 @@ const finished = common.mustCall();
   await checkLinking();
   await checkExecution();
   await checkInvalidOptionForEvaluate();
+  checkInvalidCachedData();
   finished();
-})();
+})().then(common.mustCall());

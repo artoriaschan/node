@@ -65,13 +65,13 @@ class WorkerThreadsTaskRunner::DelayedTaskScheduler {
   }
 
   void PostDelayedTask(std::unique_ptr<Task> task, double delay_in_seconds) {
-    tasks_.Push(std::unique_ptr<Task>(new ScheduleTask(this, std::move(task),
-                                                       delay_in_seconds)));
+    tasks_.Push(std::make_unique<ScheduleTask>(this, std::move(task),
+                                               delay_in_seconds));
     uv_async_send(&flush_tasks_);
   }
 
   void Stop() {
-    tasks_.Push(std::unique_ptr<Task>(new StopTask(this)));
+    tasks_.Push(std::make_unique<StopTask>(this));
     uv_async_send(&flush_tasks_);
   }
 
@@ -333,7 +333,8 @@ NodePlatform::NodePlatform(int thread_pool_size,
   // TODO(addaleax): It's a bit icky that we use global state here, but we can't
   // really do anything about it unless V8 starts exposing a way to access the
   // current v8::Platform instance.
-  tracing::TraceEventHelper::SetTracingController(tracing_controller_);
+  SetTracingController(tracing_controller_);
+  DCHECK_EQ(GetTracingController(), tracing_controller_);
   worker_thread_task_runner_ =
       std::make_shared<WorkerThreadsTaskRunner>(thread_pool_size);
 }
@@ -408,6 +409,9 @@ void PerIsolatePlatformData::RunForegroundTask(std::unique_ptr<Task> task) {
                                    InternalCallbackScope::kNoFlags);
     task->Run();
   } else {
+    // The task is moved out of InternalCallbackScope if env is not available.
+    // This is a required else block, and should not be removed.
+    // See comment: https://github.com/nodejs/node/pull/34688#pullrequestreview-463867489
     task->Run();
   }
 }
@@ -509,6 +513,12 @@ bool NodePlatform::FlushForegroundTasks(Isolate* isolate) {
   return per_isolate->FlushForegroundTasksInternal();
 }
 
+std::unique_ptr<v8::JobHandle> NodePlatform::PostJob(v8::TaskPriority priority,
+                                       std::unique_ptr<v8::JobTask> job_task) {
+  return v8::platform::NewDefaultJobHandle(
+      this, priority, std::move(job_task), NumberOfWorkerThreads());
+}
+
 bool NodePlatform::IdleTasksEnabled(Isolate* isolate) {
   return ForIsolate(isolate)->IdleTasksEnabled();
 }
@@ -608,7 +618,5 @@ std::queue<std::unique_ptr<T>> TaskQueue<T>::PopAll() {
   result.swap(task_queue_);
   return result;
 }
-
-void MultiIsolatePlatform::CancelPendingDelayedTasks(Isolate* isolate) {}
 
 }  // namespace node

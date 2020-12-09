@@ -8,11 +8,13 @@ const {
   Transform,
   pipeline,
   PassThrough,
-  Duplex
+  Duplex,
+  addAbortSignal,
 } = require('stream');
 const assert = require('assert');
 const http = require('http');
 const { promisify } = require('util');
+const net = require('net');
 
 {
   let finished = false;
@@ -43,8 +45,7 @@ const { promisify } = require('util');
   }
   read.push(null);
 
-  pipeline(read, write, common.mustCall((err) => {
-    assert.ok(!err, 'no error');
+  pipeline(read, write, common.mustSucceed(() => {
     assert.ok(finished);
     assert.deepStrictEqual(processed, expected);
   }));
@@ -254,7 +255,7 @@ const { promisify } = require('util');
 
 {
   const server = http.createServer((req, res) => {
-    pipeline(req, res, common.mustCall());
+    pipeline(req, res, common.mustSucceed());
   });
 
   server.listen(0, () => {
@@ -375,8 +376,7 @@ const { promisify } = require('util');
     rs,
     oldStream,
     ws,
-    common.mustCall((err) => {
-      assert(!err, 'no error');
+    common.mustSucceed(() => {
       assert(finished, 'last stream finished');
     })
   );
@@ -527,8 +527,7 @@ const { promisify } = require('util');
   pipeline(function*() {
     yield 'hello';
     yield 'world';
-  }(), w, common.mustCall((err) => {
-    assert.ok(!err);
+  }(), w, common.mustSucceed(() => {
     assert.strictEqual(res, 'helloworld');
   }));
 }
@@ -545,8 +544,7 @@ const { promisify } = require('util');
     await Promise.resolve();
     yield 'hello';
     yield 'world';
-  }(), w, common.mustCall((err) => {
-    assert.ok(!err);
+  }(), w, common.mustSucceed(() => {
     assert.strictEqual(res, 'helloworld');
   }));
 }
@@ -562,8 +560,7 @@ const { promisify } = require('util');
   pipeline(function*() {
     yield 'hello';
     yield 'world';
-  }, w, common.mustCall((err) => {
-    assert.ok(!err);
+  }, w, common.mustSucceed(() => {
     assert.strictEqual(res, 'helloworld');
   }));
 }
@@ -580,8 +577,7 @@ const { promisify } = require('util');
     await Promise.resolve();
     yield 'hello';
     yield 'world';
-  }, w, common.mustCall((err) => {
-    assert.ok(!err);
+  }, w, common.mustSucceed(() => {
     assert.strictEqual(res, 'helloworld');
   }));
 }
@@ -600,8 +596,7 @@ const { promisify } = require('util');
     for await (const chunk of source) {
       res += chunk;
     }
-  }, common.mustCall((err) => {
-    assert.ok(!err);
+  }, common.mustSucceed(() => {
     assert.strictEqual(res, 'HELLOWORLD');
   }));
 }
@@ -621,8 +616,7 @@ const { promisify } = require('util');
       ret += chunk;
     }
     return ret;
-  }, common.mustCall((err, val) => {
-    assert.ok(!err);
+  }, common.mustSucceed((val) => {
     assert.strictEqual(val, 'HELLOWORLD');
   }));
 }
@@ -634,9 +628,7 @@ const { promisify } = require('util');
     await Promise.resolve();
     yield 'hello';
   }, async function*(source) {
-    for await (const chunk of source) {
-      chunk;
-    }
+    for await (const chunk of source) {}
   }, common.mustCall((err) => {
     assert.strictEqual(err, undefined);
   }));
@@ -652,9 +644,7 @@ const { promisify } = require('util');
     await Promise.resolve();
     throw new Error('kaboom');
   }, async function*(source) {
-    for await (const chunk of source) {
-      chunk;
-    }
+    for await (const chunk of source) {}
   }, common.mustCall((err) => {
     assert.strictEqual(err.message, 'kaboom');
   }));
@@ -710,7 +700,6 @@ const { promisify } = require('util');
     yield 'world';
   }, s, async function(source) {
     for await (const chunk of source) {
-      chunk;
       throw new Error('kaboom');
     }
   }, common.mustCall((err, val) => {
@@ -725,7 +714,6 @@ const { promisify } = require('util');
     return ['hello', 'world'];
   }, s, async function*(source) {
     for await (const chunk of source) {
-      chunk;
       throw new Error('kaboom');
     }
   }, common.mustCall((err) => {
@@ -894,8 +882,7 @@ const { promisify } = require('util');
     for await (const chunk of source) {
       res += chunk;
     }
-  }, common.mustCall((err) => {
-    assert.ok(!err);
+  }, common.mustSucceed(() => {
     assert.strictEqual(res, 'HELLOWORLD');
   }));
 }
@@ -916,7 +903,7 @@ const { promisify } = require('util');
   const src = new PassThrough({ autoDestroy: false });
   const dst = new PassThrough({ autoDestroy: false });
   pipeline(src, dst, common.mustCall(() => {
-    assert.strictEqual(src.destroyed, true);
+    assert.strictEqual(src.destroyed, false);
     assert.strictEqual(dst.destroyed, false);
   }));
   src.end();
@@ -953,8 +940,7 @@ const { promisify } = require('util');
     pipeline(
       body,
       req,
-      common.mustCall((err) => {
-        assert(!err);
+      common.mustSucceed(() => {
         assert(!req.res);
         assert(!req.aborted);
         req.abort();
@@ -968,8 +954,7 @@ const { promisify } = require('util');
 {
   const src = new PassThrough();
   const dst = new PassThrough();
-  pipeline(src, dst, common.mustCall((err) => {
-    assert(!err);
+  pipeline(src, dst, common.mustSucceed(() => {
     assert.strictEqual(dst.destroyed, false);
   }));
   src.end();
@@ -979,9 +964,8 @@ const { promisify } = require('util');
   const src = new PassThrough();
   const dst = new PassThrough();
   dst.readable = false;
-  pipeline(src, dst, common.mustCall((err) => {
-    assert(!err);
-    assert.strictEqual(dst.destroyed, true);
+  pipeline(src, dst, common.mustSucceed(() => {
+    assert.strictEqual(dst.destroyed, false);
   }));
   src.end();
 }
@@ -1074,9 +1058,7 @@ const { promisify } = require('util');
     for await (const chunk of source) {
       yield { chunk };
     }
-  }, common.mustCall((err) => {
-    assert.ifError(err);
-  }));
+  }, common.mustSucceed());
 }
 
 {
@@ -1117,4 +1099,189 @@ const { promisify } = require('util');
   pipeline(src, dst, common.mustCall((err) => {
     assert.strictEqual(closed, true);
   }));
+}
+
+{
+  const server = net.createServer(common.mustCall((socket) => {
+    // echo server
+    pipeline(socket, socket, common.mustSucceed());
+    // 13 force destroys the socket before it has a chance to emit finish
+    socket.on('finish', common.mustCall(() => {
+      server.close();
+    }));
+  })).listen(0, common.mustCall(() => {
+    const socket = net.connect(server.address().port);
+    socket.end();
+  }));
+}
+
+{
+  const d = new Duplex({
+    autoDestroy: false,
+    write: common.mustCall((data, enc, cb) => {
+      d.push(data);
+      cb();
+    }),
+    read: common.mustCall(() => {
+      d.push(null);
+    }),
+    final: common.mustCall((cb) => {
+      setTimeout(() => {
+        assert.strictEqual(d.destroyed, false);
+        cb();
+      }, 1000);
+    }),
+    destroy: common.mustNotCall()
+  });
+
+  const sink = new Writable({
+    write: common.mustCall((data, enc, cb) => {
+      cb();
+    })
+  });
+
+  pipeline(d, sink, common.mustSucceed());
+
+  d.write('test');
+  d.end();
+}
+
+{
+  const server = net.createServer(common.mustCall((socket) => {
+    // echo server
+    pipeline(socket, socket, common.mustSucceed());
+    socket.on('finish', common.mustCall(() => {
+      server.close();
+    }));
+  })).listen(0, common.mustCall(() => {
+    const socket = net.connect(server.address().port);
+    socket.end();
+  }));
+}
+
+{
+  const d = new Duplex({
+    autoDestroy: false,
+    write: common.mustCall((data, enc, cb) => {
+      d.push(data);
+      cb();
+    }),
+    read: common.mustCall(() => {
+      d.push(null);
+    }),
+    final: common.mustCall((cb) => {
+      setTimeout(() => {
+        assert.strictEqual(d.destroyed, false);
+        cb();
+      }, 1000);
+    }),
+    // `destroy()` won't be invoked by pipeline since
+    // the writable side has not completed when
+    // the pipeline has completed.
+    destroy: common.mustNotCall()
+  });
+
+  const sink = new Writable({
+    write: common.mustCall((data, enc, cb) => {
+      cb();
+    })
+  });
+
+  pipeline(d, sink, common.mustSucceed());
+
+  d.write('test');
+  d.end();
+}
+
+{
+  const r = new Readable({
+    read() {}
+  });
+  r.push('hello');
+  r.push('world');
+  r.push(null);
+  let res = '';
+  const w = new Writable({
+    write(chunk, encoding, callback) {
+      res += chunk;
+      callback();
+    }
+  });
+  pipeline([r, w], common.mustSucceed(() => {
+    assert.strictEqual(res, 'helloworld');
+  }));
+}
+
+{
+  let flushed = false;
+  const makeStream = () =>
+    new Transform({
+      transform: (chunk, enc, cb) => cb(null, chunk),
+      flush: (cb) =>
+        setTimeout(() => {
+          flushed = true;
+          cb(null);
+        }, 1),
+    });
+
+  const input = new Readable();
+  input.push(null);
+
+  pipeline(
+    input,
+    makeStream(),
+    common.mustCall(() => {
+      assert.strictEqual(flushed, true);
+    }),
+  );
+}
+{
+  function createThenable() {
+    let counter = 0;
+    return {
+      get then() {
+        if (counter++) {
+          throw new Error('Cannot access `then` more than once');
+        }
+        return Function.prototype;
+      },
+    };
+  }
+
+  pipeline(
+    function* () {
+      yield 0;
+    },
+    createThenable,
+    () => common.mustNotCall(),
+  );
+}
+
+
+{
+  const ac = new AbortController();
+  const r = Readable.from(async function* () {
+    for (let i = 0; i < 10; i++) {
+      await Promise.resolve();
+      yield String(i);
+      if (i === 5) {
+        ac.abort();
+      }
+    }
+  }());
+  let res = '';
+  const w = new Writable({
+    write(chunk, encoding, callback) {
+      res += chunk;
+      callback();
+    }
+  });
+  const cb = common.mustCall((err) => {
+    assert.strictEqual(err.name, 'AbortError');
+    assert.strictEqual(res, '012345');
+    assert.strictEqual(w.destroyed, true);
+    assert.strictEqual(r.destroyed, true);
+    assert.strictEqual(pipelined.destroyed, true);
+  });
+  const pipelined = addAbortSignal(ac.signal, pipeline([r, w], cb));
 }

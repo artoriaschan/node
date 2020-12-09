@@ -24,15 +24,19 @@
 
 #if defined(NODE_WANT_INTERNALS) && NODE_WANT_INTERNALS
 
+#include <type_traits>  // std::remove_reference
 #include "memory_tracker.h"
 #include "v8.h"
-#include <type_traits>  // std::remove_reference
 
 namespace node {
 
 class Environment;
 template <typename T, bool kIsWeak>
 class BaseObjectPtrImpl;
+
+namespace worker {
+class TransferData;
+}
 
 class BaseObject : public MemoryRetainer {
  public:
@@ -61,9 +65,9 @@ class BaseObject : public MemoryRetainer {
   // was also passed to the `BaseObject()` constructor initially.
   // This may return `nullptr` if the C++ object has not been constructed yet,
   // e.g. when the JS object used `MakeLazilyInitializedJSTemplate`.
-  static inline BaseObject* FromJSObject(v8::Local<v8::Object> object);
+  static inline BaseObject* FromJSObject(v8::Local<v8::Value> object);
   template <typename T>
-  static inline T* FromJSObject(v8::Local<v8::Object> object);
+  static inline T* FromJSObject(v8::Local<v8::Value> object);
 
   // Make the `v8::Global` a weak reference and, `delete` this object once
   // the JS object has been garbage collected and there are no (strong)
@@ -73,6 +77,11 @@ class BaseObject : public MemoryRetainer {
   // Undo `MakeWeak()`, i.e. turn this into a strong reference that is a GC
   // root and will not be touched by the garbage collector.
   inline void ClearWeak();
+
+  // Reports whether this BaseObject is using a weak reference or detached,
+  // i.e. whether is can be deleted by GC once no strong BaseObjectPtrs refer
+  // to it anymore.
+  inline bool IsWeakOrDetached() const;
 
   // Utility to create a FunctionTemplate with one internal field (used for
   // the `BaseObject*` pointer) and a constructor that initializes that field
@@ -84,7 +93,7 @@ class BaseObject : public MemoryRetainer {
   template <int Field>
   static void InternalFieldGet(v8::Local<v8::String> property,
                                const v8::PropertyCallbackInfo<v8::Value>& info);
-  template <int Field, bool (v8::Value::* typecheck)() const>
+  template <int Field, bool (v8::Value::*typecheck)() const>
   static void InternalFieldSet(v8::Local<v8::String> property,
                                v8::Local<v8::Value> value,
                                const v8::PropertyCallbackInfo<void>& info);
@@ -92,17 +101,66 @@ class BaseObject : public MemoryRetainer {
   // This is a bit of a hack. See the override in async_wrap.cc for details.
   virtual bool IsDoneInitializing() const;
 
-  // Can be used to avoid this object keepling itself alive as a GC root
+  // Can be used to avoid this object keeping itself alive as a GC root
   // indefinitely, for example when this object is owned and deleted by another
   // BaseObject once that is torn down. This can only be called when there is
   // a BaseObjectPtr to this object.
   inline void Detach();
 
- protected:
+  static v8::Local<v8::FunctionTemplate> GetConstructorTemplate(
+      Environment* env);
+
+  // Interface for transferring BaseObject instances using the .postMessage()
+  // method of MessagePorts (and, by extension, Workers).
+  // GetTransferMode() returns a transfer mode that indicates how to deal with
+  // the current object:
+  // - kUntransferable:
+  //     No transfer is possible, either because this type of BaseObject does
+  //     not know how to be transferred, or because it is not in a state in
+  //     which it is possible to do so (e.g. because it has already been
+  //     transferred).
+  // - kTransferable:
+  //     This object can be transferred in a destructive fashion, i.e. will be
+  //     rendered unusable on the sending side of the channel in the process
+  //     of being transferred. (In C++ this would be referred to as movable but
+  //     not copyable.) Objects of this type need to be listed in the
+  //     `transferList` argument of the relevant postMessage() call in order to
+  //     make sure that they are not accidentally destroyed on the sending side.
+  //     TransferForMessaging() will be called to get a representation of the
+  //     object that is used for subsequent deserialization.
+  //     The NestedTransferables() method can be used to transfer other objects
+  //     along with this one, if a situation requires it.
+  // - kCloneable:
+  //     This object can be cloned without being modified.
+  //     CloneForMessaging() will be called to get a representation of the
+  //     object that is used for subsequent deserialization, unless the
+  //     object is listed in transferList, in which case TransferForMessaging()
+  //     is attempted first.
+  // After a successful clone, FinalizeTransferRead() is called on the receiving
+  // end, and can read deserialize JS data possibly serialized by a previous
+  // FinalizeTransferWrite() call.
+  enum class TransferMode {
+    kUntransferable,
+    kTransferable,
+    kCloneable
+  };
+  virtual TransferMode GetTransferMode() const;
+  virtual std::unique_ptr<worker::TransferData> TransferForMessaging();
+  virtual std::unique_ptr<worker::TransferData> CloneForMessaging() const;
+  virtual v8::Maybe<std::vector<BaseObjectPtrImpl<BaseObject, false>>>
+      NestedTransferables() const;
+  virtual v8::Maybe<bool> FinalizeTransferRead(
+      v8::Local<v8::Context> context, v8::ValueDeserializer* deserializer);
+
+  // Indicates whether this object is expected to use a strong reference during
+  // a clean process exit (due to an empty event loop).
+  virtual bool IsNotIndicativeOfMemoryLeakAtExit() const;
+
   virtual inline void OnGCCollect();
 
  private:
   v8::Local<v8::Object> WrappedObject() const override;
+  bool IsRootNode() const override;
   static void DeleteMe(void* data);
 
   // persistent_handle_ needs to be at a fixed offset from the start of the
@@ -152,17 +210,15 @@ class BaseObject : public MemoryRetainer {
 
 // Global alias for FromJSObject() to avoid churn.
 template <typename T>
-inline T* Unwrap(v8::Local<v8::Object> obj) {
+inline T* Unwrap(v8::Local<v8::Value> obj) {
   return BaseObject::FromJSObject<T>(obj);
 }
 
-
-#define ASSIGN_OR_RETURN_UNWRAP(ptr, obj, ...)                                \
-  do {                                                                        \
-    *ptr = static_cast<typename std::remove_reference<decltype(*ptr)>::type>( \
-        BaseObject::FromJSObject(obj));                                       \
-    if (*ptr == nullptr)                                                      \
-      return __VA_ARGS__;                                                     \
+#define ASSIGN_OR_RETURN_UNWRAP(ptr, obj, ...)                                 \
+  do {                                                                         \
+    *ptr = static_cast<typename std::remove_reference<decltype(*ptr)>::type>(  \
+        BaseObject::FromJSObject(obj));                                        \
+    if (*ptr == nullptr) return __VA_ARGS__;                                   \
   } while (0)
 
 // Implementation of a generic strong or weak pointer to a BaseObject.
@@ -196,9 +252,14 @@ class BaseObjectPtrImpl final {
   inline T* operator->() const;
   inline operator bool() const;
 
+  template <typename U, bool kW>
+  inline bool operator ==(const BaseObjectPtrImpl<U, kW>& other) const;
+  template <typename U, bool kW>
+  inline bool operator !=(const BaseObjectPtrImpl<U, kW>& other) const;
+
  private:
   union {
-    BaseObject* target;  // Used for strong pointers.
+    BaseObject* target;                     // Used for strong pointers.
     BaseObject::PointerData* pointer_data;  // Used for weak pointers.
   } data_;
 

@@ -19,9 +19,10 @@
 // OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
 // USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-// Flags: --expose_internals
+// Flags: --expose-internals
 'use strict';
 const common = require('../common');
+common.skipIfDumbTerminal();
 
 const assert = require('assert');
 const readline = require('readline');
@@ -62,6 +63,12 @@ function assertCursorRowsAndCols(rli, rows, cols) {
   assert.strictEqual(cursorPos.cols, cols);
 }
 
+{
+  const input = new FakeInput();
+  const rl = readline.Interface({ input });
+  assert(rl instanceof readline.Interface);
+}
+
 [
   undefined,
   50,
@@ -85,7 +92,7 @@ function assertCursorRowsAndCols(rli, rows, cols) {
     });
   }, {
     name: 'TypeError',
-    code: 'ERR_INVALID_OPT_VALUE'
+    code: 'ERR_INVALID_ARG_VALUE'
   });
 
   assert.throws(() => {
@@ -95,7 +102,7 @@ function assertCursorRowsAndCols(rli, rows, cols) {
     });
   }, {
     name: 'TypeError',
-    code: 'ERR_INVALID_OPT_VALUE'
+    code: 'ERR_INVALID_ARG_VALUE'
   });
 
   assert.throws(() => {
@@ -105,7 +112,7 @@ function assertCursorRowsAndCols(rli, rows, cols) {
     });
   }, {
     name: 'TypeError',
-    code: 'ERR_INVALID_OPT_VALUE'
+    code: 'ERR_INVALID_ARG_VALUE'
   });
 
   // Constructor throws if historySize is not a positive number
@@ -116,7 +123,7 @@ function assertCursorRowsAndCols(rli, rows, cols) {
     });
   }, {
     name: 'RangeError',
-    code: 'ERR_INVALID_OPT_VALUE'
+    code: 'ERR_INVALID_ARG_VALUE'
   });
 
   assert.throws(() => {
@@ -126,7 +133,7 @@ function assertCursorRowsAndCols(rli, rows, cols) {
     });
   }, {
     name: 'RangeError',
-    code: 'ERR_INVALID_OPT_VALUE'
+    code: 'ERR_INVALID_ARG_VALUE'
   });
 
   assert.throws(() => {
@@ -136,7 +143,7 @@ function assertCursorRowsAndCols(rli, rows, cols) {
     });
   }, {
     name: 'RangeError',
-    code: 'ERR_INVALID_OPT_VALUE'
+    code: 'ERR_INVALID_ARG_VALUE'
   });
 
   // Check for invalid tab sizes.
@@ -656,6 +663,13 @@ function assertCursorRowsAndCols(rli, rows, cols) {
   rli.close();
 }
 
+// Close readline interface
+{
+  const [rli, fi] = getInterface({ terminal: true, prompt: '' });
+  fi.emit('keypress', '.', { ctrl: true, name: 'c' });
+  assert(rli.closed);
+}
+
 // Multi-line input cursor position
 {
   const [rli, fi] = getInterface({ terminal: true, prompt: '' });
@@ -897,6 +911,16 @@ for (let i = 0; i < 12; i++) {
     });
   }
 
+  // Calling the getPrompt method
+  {
+    const expectedPrompts = ['$ ', '> '];
+    const [rli] = getInterface({ terminal });
+    for (const prompt of expectedPrompts) {
+      rli.setPrompt(prompt);
+      assert.strictEqual(rli.getPrompt(), prompt);
+    }
+  }
+
   {
     const expected = terminal ?
       ['\u001b[1G', '\u001b[0J', '$ ', '\u001b[3G'] :
@@ -919,7 +943,7 @@ for (let i = 0; i < 12; i++) {
 
     rl.prompt();
 
-    assert.strictEqual(rl._prompt, '$ ');
+    assert.strictEqual(rl.getPrompt(), '$ ');
   }
 
   {

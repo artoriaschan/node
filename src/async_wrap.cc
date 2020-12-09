@@ -23,6 +23,7 @@
 #include "async_wrap-inl.h"
 #include "env-inl.h"
 #include "node_errors.h"
+#include "node_external_reference.h"
 #include "tracing/traced_value.h"
 #include "util-inl.h"
 
@@ -38,8 +39,12 @@ using v8::Global;
 using v8::HandleScope;
 using v8::Integer;
 using v8::Isolate;
+using v8::Just;
 using v8::Local;
+using v8::Maybe;
 using v8::MaybeLocal;
+using v8::Name;
+using v8::Nothing;
 using v8::Number;
 using v8::Object;
 using v8::ObjectTemplate;
@@ -49,8 +54,6 @@ using v8::PropertyAttribute;
 using v8::PropertyCallbackInfo;
 using v8::ReadOnly;
 using v8::String;
-using v8::TryCatch;
-using v8::Uint32;
 using v8::Undefined;
 using v8::Value;
 using v8::WeakCallbackInfo;
@@ -65,25 +68,6 @@ static const char* const provider_names[] = {
   #PROVIDER,
   NODE_ASYNC_PROVIDER_TYPES(V)
 #undef V
-};
-
-
-struct AsyncWrapObject : public AsyncWrap {
-  static inline void New(const FunctionCallbackInfo<Value>& args) {
-    Environment* env = Environment::GetCurrent(args);
-    CHECK(args.IsConstructCall());
-    CHECK(env->async_wrap_object_ctor_template()->HasInstance(args.This()));
-    CHECK(args[0]->IsUint32());
-    auto type = static_cast<ProviderType>(args[0].As<Uint32>()->Value());
-    new AsyncWrapObject(env, args.This(), type);
-  }
-
-  inline AsyncWrapObject(Environment* env, Local<Object> object,
-                         ProviderType type) : AsyncWrap(env, object, type) {}
-
-  SET_NO_MEMORY_INFO()
-  SET_MEMORY_INFO_NAME(AsyncWrapObject)
-  SET_SELF_SIZE(AsyncWrapObject)
 };
 
 void AsyncWrap::DestroyAsyncIdsCallback(Environment* env) {
@@ -174,14 +158,31 @@ void AsyncWrap::EmitAfter(Environment* env, double async_id) {
        env->async_hooks_after_function());
 }
 
+// TODO(addaleax): Remove once we're on C++17.
+constexpr double AsyncWrap::kInvalidAsyncId;
+
+static Maybe<double> GetAssignedPromiseAsyncId(Environment* env,
+                                               Local<Promise> promise,
+                                               Local<Value> id_symbol) {
+  Local<Value> maybe_async_id;
+  if (!promise->Get(env->context(), id_symbol).ToLocal(&maybe_async_id)) {
+    return Nothing<double>();
+  }
+  return maybe_async_id->IsNumber()
+      ? maybe_async_id->NumberValue(env->context())
+      : Just(AsyncWrap::kInvalidAsyncId);
+}
+
 class PromiseWrap : public AsyncWrap {
  public:
-  enum InternalFields {
-    kIsChainedPromiseField = AsyncWrap::kInternalFieldCount,
-    kInternalFieldCount
-  };
   PromiseWrap(Environment* env, Local<Object> object, bool silent)
       : AsyncWrap(env, object, PROVIDER_PROMISE, kInvalidAsyncId, silent) {
+    MakeWeak();
+  }
+
+  PromiseWrap(Environment* env, Local<Object> object, double asyncId,
+    double triggerAsyncId)
+      : AsyncWrap(env, object, PROVIDER_PROMISE, asyncId, triggerAsyncId) {
     MakeWeak();
   }
 
@@ -191,31 +192,88 @@ class PromiseWrap : public AsyncWrap {
 
   static PromiseWrap* New(Environment* env,
                           Local<Promise> promise,
-                          PromiseWrap* parent_wrap,
                           bool silent);
-  static void getIsChainedPromise(Local<String> property,
-                                  const PropertyCallbackInfo<Value>& info);
+  static void GetAsyncId(Local<Name> property,
+                         const PropertyCallbackInfo<Value>& args);
+  static void GetTriggerAsyncId(Local<Name> property,
+                                const PropertyCallbackInfo<Value>& args);
+
+  static void Initialize(Environment* env);
 };
 
 PromiseWrap* PromiseWrap::New(Environment* env,
                               Local<Promise> promise,
-                              PromiseWrap* parent_wrap,
                               bool silent) {
+  Local<Context> context = env->context();
+
   Local<Object> obj;
-  if (!env->promise_wrap_template()->NewInstance(env->context()).ToLocal(&obj))
+  if (!env->promise_wrap_template()->NewInstance(context).ToLocal(&obj))
     return nullptr;
-  obj->SetInternalField(PromiseWrap::kIsChainedPromiseField,
-                        parent_wrap != nullptr ? v8::True(env->isolate())
-                                               : v8::False(env->isolate()));
+
   CHECK_NULL(promise->GetAlignedPointerFromInternalField(0));
   promise->SetInternalField(0, obj);
+
+  // Skip for init events
+  if (silent) {
+    double async_id;
+    double trigger_async_id;
+    if (!GetAssignedPromiseAsyncId(env, promise, env->async_id_symbol())
+            .To(&async_id)) return nullptr;
+    if (!GetAssignedPromiseAsyncId(env, promise, env->trigger_async_id_symbol())
+            .To(&trigger_async_id)) return nullptr;
+
+    if (async_id != AsyncWrap::kInvalidAsyncId &&
+        trigger_async_id != AsyncWrap::kInvalidAsyncId) {
+      return new PromiseWrap(
+          env, obj, async_id, trigger_async_id);
+    }
+  }
+
   return new PromiseWrap(env, obj, silent);
 }
 
-void PromiseWrap::getIsChainedPromise(Local<String> property,
-                                      const PropertyCallbackInfo<Value>& info) {
-  info.GetReturnValue().Set(
-      info.Holder()->GetInternalField(PromiseWrap::kIsChainedPromiseField));
+void PromiseWrap::GetAsyncId(Local<Name> property,
+                             const PropertyCallbackInfo<Value>& info) {
+  Isolate* isolate = info.GetIsolate();
+  HandleScope scope(isolate);
+
+  PromiseWrap* wrap = Unwrap<PromiseWrap>(info.Holder());
+  double value = wrap->get_async_id();
+
+  info.GetReturnValue().Set(Number::New(isolate, value));
+}
+
+void PromiseWrap::GetTriggerAsyncId(Local<Name> property,
+                                    const PropertyCallbackInfo<Value>& info) {
+  Isolate* isolate = info.GetIsolate();
+  HandleScope scope(isolate);
+
+  PromiseWrap* wrap = Unwrap<PromiseWrap>(info.Holder());
+  double value = wrap->get_trigger_async_id();
+
+  info.GetReturnValue().Set(Number::New(isolate, value));
+}
+
+void PromiseWrap::Initialize(Environment* env) {
+  Isolate* isolate = env->isolate();
+  HandleScope scope(isolate);
+
+  Local<FunctionTemplate> ctor = FunctionTemplate::New(isolate);
+  ctor->SetClassName(FIXED_ONE_BYTE_STRING(isolate, "PromiseWrap"));
+
+  Local<ObjectTemplate> promise_wrap_template = ctor->InstanceTemplate();
+  env->set_promise_wrap_template(promise_wrap_template);
+
+  promise_wrap_template->SetInternalFieldCount(
+      PromiseWrap::kInternalFieldCount);
+
+  promise_wrap_template->SetAccessor(
+      env->async_id_symbol(),
+      PromiseWrap::GetAsyncId);
+
+  promise_wrap_template->SetAccessor(
+      env->trigger_async_id_symbol(),
+      PromiseWrap::GetTriggerAsyncId);
 }
 
 static PromiseWrap* extractPromiseWrap(Local<Promise> promise) {
@@ -227,8 +285,78 @@ static PromiseWrap* extractPromiseWrap(Local<Promise> promise) {
   return obj->IsObject() ? Unwrap<PromiseWrap>(obj.As<Object>()) : nullptr;
 }
 
-static void PromiseHook(PromiseHookType type, Local<Promise> promise,
-                        Local<Value> parent) {
+static uint16_t ToAsyncHooksType(PromiseHookType type) {
+  switch (type) {
+    case PromiseHookType::kInit:    return AsyncHooks::kInit;
+    case PromiseHookType::kBefore:  return AsyncHooks::kBefore;
+    case PromiseHookType::kAfter:   return AsyncHooks::kAfter;
+    case PromiseHookType::kResolve: return AsyncHooks::kPromiseResolve;
+  }
+  UNREACHABLE();
+}
+
+// Simplified JavaScript hook fast-path for when there is no destroy hook
+static void FastPromiseHook(PromiseHookType type, Local<Promise> promise,
+                            Local<Value> parent) {
+  Local<Context> context = promise->CreationContext();
+  Environment* env = Environment::GetCurrent(context);
+  if (env == nullptr) return;
+
+  if (type == PromiseHookType::kBefore &&
+      env->async_hooks()->fields()[AsyncHooks::kBefore] == 0) {
+    double async_id;
+    double trigger_async_id;
+    if (!GetAssignedPromiseAsyncId(env, promise, env->async_id_symbol())
+            .To(&async_id)) return;
+    if (!GetAssignedPromiseAsyncId(env, promise, env->trigger_async_id_symbol())
+            .To(&trigger_async_id)) return;
+
+    if (async_id != AsyncWrap::kInvalidAsyncId &&
+        trigger_async_id != AsyncWrap::kInvalidAsyncId) {
+      env->async_hooks()->push_async_context(
+          async_id, trigger_async_id, promise);
+      return;
+    }
+  }
+
+  if (type == PromiseHookType::kAfter &&
+      env->async_hooks()->fields()[AsyncHooks::kAfter] == 0) {
+    double async_id;
+    if (!GetAssignedPromiseAsyncId(env, promise, env->async_id_symbol())
+            .To(&async_id)) return;
+
+    if (async_id != AsyncWrap::kInvalidAsyncId) {
+      if (env->execution_async_id() == async_id) {
+        // This condition might not be true if async_hooks was enabled during
+        // the promise callback execution.
+        env->async_hooks()->pop_async_context(async_id);
+      }
+      return;
+    }
+  }
+
+  if (type == PromiseHookType::kResolve &&
+      env->async_hooks()->fields()[AsyncHooks::kPromiseResolve] == 0) {
+    return;
+  }
+
+  // Getting up to this point means either init type or
+  // that there are active hooks of another type.
+  // In both cases fast-path JS hook should be called.
+
+  Local<Value> argv[] = {
+    Integer::New(env->isolate(), ToAsyncHooksType(type)),
+    promise,
+    parent
+  };
+
+  TryCatchScope try_catch(env, TryCatchScope::CatchMode::kFatal);
+  Local<Function> promise_hook = env->promise_hook_handler();
+  USE(promise_hook->Call(context, Undefined(env->isolate()), 3, argv));
+}
+
+static void FullPromiseHook(PromiseHookType type, Local<Promise> promise,
+                            Local<Value> parent) {
   Local<Context> context = promise->CreationContext();
 
   Environment* env = Environment::GetCurrent(context);
@@ -248,14 +376,14 @@ static void PromiseHook(PromiseHookType type, Local<Promise> promise,
       Local<Promise> parent_promise = parent.As<Promise>();
       PromiseWrap* parent_wrap = extractPromiseWrap(parent_promise);
       if (parent_wrap == nullptr) {
-        parent_wrap = PromiseWrap::New(env, parent_promise, nullptr, true);
+        parent_wrap = PromiseWrap::New(env, parent_promise, true);
         if (parent_wrap == nullptr) return;
       }
 
       AsyncHooks::DefaultTriggerAsyncIdScope trigger_scope(parent_wrap);
-      wrap = PromiseWrap::New(env, promise, parent_wrap, silent);
+      wrap = PromiseWrap::New(env, promise, silent);
     } else {
-      wrap = PromiseWrap::New(env, promise, nullptr, silent);
+      wrap = PromiseWrap::New(env, promise, silent);
     }
   }
 
@@ -282,15 +410,15 @@ static void PromiseHook(PromiseHookType type, Local<Promise> promise,
   }
 }
 
-
 static void SetupHooks(const FunctionCallbackInfo<Value>& args) {
   Environment* env = Environment::GetCurrent(args);
 
   CHECK(args[0]->IsObject());
 
-  // All of init, before, after, destroy are supplied by async_hooks
-  // internally, so this should every only be called once. At which time all
-  // the functions should be set. Detect this by checking if init !IsEmpty().
+  // All of init, before, after, destroy, and promise_resolve are supplied by
+  // async_hooks internally, so this should only ever be called once. At which
+  // time all the functions should be set. Detect this by checking if
+  // init !IsEmpty().
   CHECK(env->async_hooks_init_function().IsEmpty());
 
   Local<Object> fn_obj = args[0].As<Object>();
@@ -311,34 +439,28 @@ static void SetupHooks(const FunctionCallbackInfo<Value>& args) {
   SET_HOOK_FN(destroy);
   SET_HOOK_FN(promise_resolve);
 #undef SET_HOOK_FN
+}
 
-  {
-    Local<FunctionTemplate> ctor =
-        FunctionTemplate::New(env->isolate());
-    ctor->SetClassName(FIXED_ONE_BYTE_STRING(env->isolate(), "PromiseWrap"));
-    Local<ObjectTemplate> promise_wrap_template = ctor->InstanceTemplate();
-    promise_wrap_template->SetInternalFieldCount(
-        PromiseWrap::kInternalFieldCount);
-    promise_wrap_template->SetAccessor(
-        FIXED_ONE_BYTE_STRING(env->isolate(), "isChainedPromise"),
-        PromiseWrap::getIsChainedPromise);
-    env->set_promise_wrap_template(promise_wrap_template);
+static void EnablePromiseHook(const FunctionCallbackInfo<Value>& args) {
+  Environment* env = Environment::GetCurrent(args);
+
+  if (args[0]->IsFunction()) {
+    env->set_promise_hook_handler(args[0].As<Function>());
+    args.GetIsolate()->SetPromiseHook(FastPromiseHook);
+  } else {
+    args.GetIsolate()->SetPromiseHook(FullPromiseHook);
   }
 }
 
 
-static void EnablePromiseHook(const FunctionCallbackInfo<Value>& args) {
-  args.GetIsolate()->SetPromiseHook(PromiseHook);
-}
-
-
 static void DisablePromiseHook(const FunctionCallbackInfo<Value>& args) {
-  Isolate* isolate = args.GetIsolate();
+  Environment* env = Environment::GetCurrent(args);
+  env->set_promise_hook_handler(Local<Function>());
 
   // The per-Isolate API provides no way of knowing whether there are multiple
   // users of the PromiseHook. That hopefully goes away when V8 introduces
   // a per-context API.
-  isolate->SetPromiseHook(nullptr);
+  args.GetIsolate()->SetPromiseHook(nullptr);
 }
 
 
@@ -405,7 +527,7 @@ void AsyncWrap::PushAsyncContext(const FunctionCallbackInfo<Value>& args) {
   // then the checks in push_async_ids() and pop_async_id() will.
   double async_id = args[0]->NumberValue(env->context()).FromJust();
   double trigger_async_id = args[1]->NumberValue(env->context()).FromJust();
-  env->async_hooks()->push_async_context(async_id, trigger_async_id, args[2]);
+  env->async_hooks()->push_async_context(async_id, trigger_async_id, {});
 }
 
 
@@ -413,6 +535,22 @@ void AsyncWrap::PopAsyncContext(const FunctionCallbackInfo<Value>& args) {
   Environment* env = Environment::GetCurrent(args);
   double async_id = args[0]->NumberValue(env->context()).FromJust();
   args.GetReturnValue().Set(env->async_hooks()->pop_async_context(async_id));
+}
+
+
+void AsyncWrap::ExecutionAsyncResource(
+    const FunctionCallbackInfo<Value>& args) {
+  Environment* env = Environment::GetCurrent(args);
+  uint32_t index;
+  if (!args[0]->Uint32Value(env->context()).To(&index)) return;
+  args.GetReturnValue().Set(
+      env->async_hooks()->native_execution_async_resource(index));
+}
+
+
+void AsyncWrap::ClearAsyncIdStack(const FunctionCallbackInfo<Value>& args) {
+  Environment* env = Environment::GetCurrent(args);
+  env->async_hooks()->clear_async_id_stack();
 }
 
 
@@ -437,11 +575,15 @@ void AsyncWrap::GetProviderType(const FunctionCallbackInfo<Value>& args) {
 }
 
 
-void AsyncWrap::EmitDestroy() {
+void AsyncWrap::EmitDestroy(bool from_gc) {
   AsyncWrap::EmitDestroy(env(), async_id_);
   // Ensure no double destroy is emitted via AsyncReset().
   async_id_ = kInvalidAsyncId;
-  resource_.Reset();
+
+  if (!persistent().IsEmpty() && !from_gc) {
+    HandleScope handle_scope(env()->isolate());
+    USE(object()->Set(env()->context(), env()->resource_symbol(), object()));
+  }
 }
 
 void AsyncWrap::QueueDestroyAsyncId(const FunctionCallbackInfo<Value>& args) {
@@ -451,11 +593,20 @@ void AsyncWrap::QueueDestroyAsyncId(const FunctionCallbackInfo<Value>& args) {
       args[0].As<Number>()->Value());
 }
 
+void AsyncWrap::SetCallbackTrampoline(const FunctionCallbackInfo<Value>& args) {
+  Environment* env = Environment::GetCurrent(args);
+
+  CHECK(args[0]->IsFunction());
+
+  env->set_async_hooks_callback_trampoline(args[0].As<Function>());
+}
+
 Local<FunctionTemplate> AsyncWrap::GetConstructorTemplate(Environment* env) {
   Local<FunctionTemplate> tmpl = env->async_wrap_ctor_template();
   if (tmpl.IsEmpty()) {
     tmpl = env->NewFunctionTemplate(nullptr);
     tmpl->SetClassName(FIXED_ONE_BYTE_STRING(env->isolate(), "AsyncWrap"));
+    tmpl->Inherit(BaseObject::GetConstructorTemplate(env));
     env->SetProtoMethod(tmpl, "getAsyncId", AsyncWrap::GetAsyncId);
     env->SetProtoMethod(tmpl, "asyncReset", AsyncWrap::AsyncReset);
     env->SetProtoMethod(tmpl, "getProviderType", AsyncWrap::GetProviderType);
@@ -473,8 +624,11 @@ void AsyncWrap::Initialize(Local<Object> target,
   HandleScope scope(isolate);
 
   env->SetMethod(target, "setupHooks", SetupHooks);
+  env->SetMethod(target, "setCallbackTrampoline", SetCallbackTrampoline);
   env->SetMethod(target, "pushAsyncContext", PushAsyncContext);
   env->SetMethod(target, "popAsyncContext", PopAsyncContext);
+  env->SetMethod(target, "executionAsyncResource", ExecutionAsyncResource);
+  env->SetMethod(target, "clearAsyncIdStack", ClearAsyncIdStack);
   env->SetMethod(target, "queueDestroyAsyncId", QueueDestroyAsyncId);
   env->SetMethod(target, "enablePromiseHook", EnablePromiseHook);
   env->SetMethod(target, "disablePromiseHook", DisablePromiseHook);
@@ -513,15 +667,11 @@ void AsyncWrap::Initialize(Local<Object> target,
 
   FORCE_SET_TARGET_FIELD(target,
                          "execution_async_resources",
-                         env->async_hooks()->execution_async_resources());
+                         env->async_hooks()->js_execution_async_resources());
 
   target->Set(context,
               env->async_ids_stack_string(),
               env->async_hooks()->async_ids_stack().GetJSArray()).Check();
-
-  target->Set(context,
-              FIXED_ONE_BYTE_STRING(env->isolate(), "owner_symbol"),
-              env->owner_symbol()).Check();
 
   Local<Object> constants = Object::New(isolate);
 #define SET_HOOKS_CONSTANT(name)                                              \
@@ -539,6 +689,7 @@ void AsyncWrap::Initialize(Local<Object> target,
   SET_HOOKS_CONSTANT(kTriggerAsyncId);
   SET_HOOKS_CONSTANT(kAsyncIdCounter);
   SET_HOOKS_CONSTANT(kDefaultTriggerAsyncId);
+  SET_HOOKS_CONSTANT(kUsesExecutionAsyncResource);
   SET_HOOKS_CONSTANT(kStackLength);
 #undef SET_HOOKS_CONSTANT
   FORCE_SET_TARGET_FIELD(target, "constants", constants);
@@ -560,23 +711,28 @@ void AsyncWrap::Initialize(Local<Object> target,
   env->set_async_hooks_promise_resolve_function(Local<Function>());
   env->set_async_hooks_binding(target);
 
-  // TODO(addaleax): This block might better work as a
-  // AsyncWrapObject::Initialize() or AsyncWrapObject::GetConstructorTemplate()
-  // function.
-  {
-    auto class_name = FIXED_ONE_BYTE_STRING(env->isolate(), "AsyncWrap");
-    auto function_template = env->NewFunctionTemplate(AsyncWrapObject::New);
-    function_template->SetClassName(class_name);
-    function_template->Inherit(AsyncWrap::GetConstructorTemplate(env));
-    auto instance_template = function_template->InstanceTemplate();
-    instance_template->SetInternalFieldCount(AsyncWrap::kInternalFieldCount);
-    auto function =
-        function_template->GetFunction(env->context()).ToLocalChecked();
-    target->Set(env->context(), class_name, function).Check();
-    env->set_async_wrap_object_ctor_template(function_template);
-  }
+  // TODO(qard): maybe this should be GetConstructorTemplate instead?
+  PromiseWrap::Initialize(env);
 }
 
+void AsyncWrap::RegisterExternalReferences(
+    ExternalReferenceRegistry* registry) {
+  registry->Register(SetupHooks);
+  registry->Register(SetCallbackTrampoline);
+  registry->Register(PushAsyncContext);
+  registry->Register(PopAsyncContext);
+  registry->Register(ExecutionAsyncResource);
+  registry->Register(ClearAsyncIdStack);
+  registry->Register(QueueDestroyAsyncId);
+  registry->Register(EnablePromiseHook);
+  registry->Register(DisablePromiseHook);
+  registry->Register(RegisterDestroyHook);
+  registry->Register(AsyncWrap::GetAsyncId);
+  registry->Register(AsyncWrap::AsyncReset);
+  registry->Register(AsyncWrap::GetProviderType);
+  registry->Register(PromiseWrap::GetAsyncId);
+  registry->Register(PromiseWrap::GetTriggerAsyncId);
+}
 
 AsyncWrap::AsyncWrap(Environment* env,
                      Local<Object> object,
@@ -598,13 +754,22 @@ AsyncWrap::AsyncWrap(Environment* env,
   init_hook_ran_ = true;
 }
 
+AsyncWrap::AsyncWrap(Environment* env,
+                     Local<Object> object,
+                     ProviderType provider,
+                     double execution_async_id,
+                     double trigger_async_id)
+    : AsyncWrap(env, object, provider, execution_async_id, true) {
+  trigger_async_id_ = trigger_async_id;
+}
+
 AsyncWrap::AsyncWrap(Environment* env, Local<Object> object)
   : BaseObject(env, object) {
 }
 
 // This method is necessary to work around one specific problem:
 // Before the init() hook runs, if there is one, the BaseObject() constructor
-// registers this object with the Environment for finilization and debugging
+// registers this object with the Environment for finalization and debugging
 // purposes.
 // If the Environment decides to inspect this object for debugging, it tries to
 // call virtual methods on this object that are only (meaningfully) implemented
@@ -629,7 +794,7 @@ bool AsyncWrap::IsDoneInitializing() const {
 
 AsyncWrap::~AsyncWrap() {
   EmitTraceEventDestroy();
-  EmitDestroy();
+  EmitDestroy(true /* from gc */);
 }
 
 void AsyncWrap::EmitTraceEventDestroy() {
@@ -654,7 +819,19 @@ void AsyncWrap::EmitDestroy(Environment* env, double async_id) {
   }
 
   if (env->destroy_async_id_list()->empty()) {
-    env->SetUnrefImmediate(&DestroyAsyncIdsCallback);
+    env->SetImmediate(&DestroyAsyncIdsCallback, CallbackFlags::kUnrefed);
+  }
+
+  // If the list gets very large empty it faster using a Microtask.
+  // Microtasks can't be added in GC context therefore we use an
+  // interrupt to get this Microtask scheduled as fast as possible.
+  if (env->destroy_async_id_list()->size() == 16384) {
+    env->RequestInterrupt([](Environment* env) {
+      env->isolate()->EnqueueMicrotask(
+        [](void* arg) {
+          DestroyAsyncIdsCallback(static_cast<Environment*>(arg));
+        }, env);
+      });
   }
 
   env->destroy_async_id_list()->push_back(async_id);
@@ -679,10 +856,13 @@ void AsyncWrap::AsyncReset(Local<Object> resource, double execution_async_id,
                                                      : execution_async_id;
   trigger_async_id_ = env()->get_default_trigger_async_id();
 
-  if (resource != object()) {
-    // TODO(addaleax): Using a strong reference here makes it very easy to
-    // introduce memory leaks. Move away from using a strong reference.
-    resource_.Reset(env()->isolate(), resource);
+  {
+    HandleScope handle_scope(env()->isolate());
+    Local<Object> obj = object();
+    CHECK(!obj.IsEmpty());
+    if (resource != obj) {
+      USE(obj->Set(env()->context(), env()->resource_symbol(), resource));
+    }
   }
 
   switch (provider_type()) {
@@ -752,7 +932,7 @@ MaybeLocal<Value> AsyncWrap::MakeCallback(const Local<Function> cb,
   ProviderType provider = provider_type();
   async_context context { get_async_id(), get_trigger_async_id() };
   MaybeLocal<Value> ret = InternalMakeCallback(
-      env(), GetResource(), object(), cb, argc, argv, context);
+      env(), object(), object(), cb, argc, argv, context);
 
   // This is a static call with cached values because the `this` object may
   // no longer be alive at this point.
@@ -791,14 +971,8 @@ Local<Object> AsyncWrap::GetOwner(Environment* env, Local<Object> obj) {
   }
 }
 
-Local<Object> AsyncWrap::GetResource() {
-  if (resource_.IsEmpty()) {
-    return object();
-  }
-
-  return resource_.Get(env()->isolate());
-}
-
 }  // namespace node
 
 NODE_MODULE_CONTEXT_AWARE_INTERNAL(async_wrap, node::AsyncWrap::Initialize)
+NODE_MODULE_EXTERNAL_REFERENCE(async_wrap,
+                               node::AsyncWrap::RegisterExternalReferences)
